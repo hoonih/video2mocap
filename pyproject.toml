@@ -1,0 +1,20 @@
+[project]
+name = "mocap"
+version = "0.1.0"
+description = "영상 속 사람의 동작을 추적해 3D 캐릭터에 리타게팅하는 순수 Python CLI 도구"
+requires-python = ">=3.9,<3.13"
+dependencies = [
+    "mediapipe==0.10.14",
+    "opencv-python>=4.9,<5",
+    "numpy>=1.23,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["mocap*"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
