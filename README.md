@@ -30,7 +30,7 @@ python -m mocap input.mp4
 |---|---|---|
 | `--out 경로.mp4` | 출력 영상 경로 | `<입력파일명>_mocap.mp4` |
 | `--upper-body` | 상체 모드 (가슴 위만 나오는 영상용) | 꺼짐 |
-| `--view side\|avatar` | `side`: 원본+캐릭터 나란히, `avatar`: 캐릭터만 | `side` |
+| `--view side\|avatar\|skeleton` | `side`: 원본+캐릭터 나란히, `avatar`: 캐릭터만(조건 C), `skeleton`: 선과 점으로 된 골격만(조건 B) | `side` |
 | `--yaw 각도` | 카메라 좌우 회전 각도(도) | `0` |
 | `--orbit 각도` | 프레임마다 추가로 회전할 각도(도/프레임) | `0` |
 | `--smooth 0.0~0.9` | 떨림 보정 강도 (클수록 부드럽지만 반응 느려짐) | `0.3` |

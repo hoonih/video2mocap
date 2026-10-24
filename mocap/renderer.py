@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
@@ -58,7 +58,14 @@ LEFT_SIDE_BRIGHTEN = 0.9
 OUTLINE_DARKEN = 0.45
 HIGHLIGHT_BRIGHTEN = 1.6
 
-BACKGROUND_COLOR = (24, 22, 20)
+BACKGROUND_COLOR = (24, 22, 20)  # 조건 B·C 공통 배경색
+
+# 골격 렌더러 (조건 B): 선과 점만
+SKELETON_COLOR = np.array([235, 235, 235], dtype=np.float64)
+SKELETON_LEFT_DIM = 0.75  # 좌우 구분: 화자 왼쪽 부위를 약간 어둡게
+SKELETON_LINE_THICKNESS = 4
+SKELETON_JOINT_RADIUS = 6
+SKELETON_HEAD_OUTLINE = 2
 FLOOR_COLOR = (50, 48, 45)
 SHADOW_COLOR = (15, 15, 15)
 
@@ -96,8 +103,48 @@ def _side_color(part_name: str) -> np.ndarray:
     return BASE_COLOR.copy()
 
 
-class CapsuleRenderer:
-    """캡슐형 팔다리 + 몸통 폴리곤 + 구형 머리로 이루어진 캐릭터를 그리는 렌더러."""
+@dataclass
+class _Head:
+    """머리 구의 위치와 화면상 크기. 모든 렌더러가 같은 값을 쓴다."""
+
+    world: np.ndarray
+    cam: np.ndarray
+    px: np.ndarray
+    radius_px: int
+
+
+@dataclass
+class _FaceLayout:
+    """얼굴 요소의 화면 좌표와 가시성 (landmarks.FACE_KEY_ORDER 이름 기준)."""
+
+    pts: Dict[str, np.ndarray]
+    visible: Dict[str, bool]
+
+    def polygon(self, names) -> Optional[np.ndarray]:
+        """names가 모두 보일 때만 (N,2) int32 좌표를 돌려준다."""
+        if not all(self.visible[n] for n in names):
+            return None
+        return np.array([self.pts[n] for n in names], dtype=np.int32)
+
+
+def _draw_hand_chains(img: np.ndarray, proj: np.ndarray, color: Tuple[int, int, int]) -> None:
+    """손목에서 각 손가락 끝까지 선과 관절 점을 그린다. 조건 B·C가 같은 손 표현을 쓴다."""
+    wrist_px = tuple(proj[landmarks.HAND_WRIST].astype(int))
+    for finger in landmarks.HAND_FINGERS:
+        prev_pt = wrist_px
+        for joint_idx in finger:
+            pt = tuple(proj[joint_idx].astype(int))
+            cv2.line(img, prev_pt, pt, color, FINGER_THICKNESS, cv2.LINE_AA)
+            cv2.circle(img, pt, HAND_JOINT_RADIUS, color, -1, cv2.LINE_AA)
+            prev_pt = pt
+
+
+class _ProjectedRenderer:
+    """카메라·투영·배경·머리/얼굴 배치를 공유하는 렌더러 베이스.
+
+    조건 B(SkeletonRenderer)와 C(CapsuleRenderer)는 화자 위치와 크기가 픽셀 단위로 같아야 하므로
+    카메라 파라미터와 머리/얼굴 기하는 전부 여기서만 계산한다. 하위 클래스는 그리기만 한다.
+    """
 
     def __init__(
         self,
@@ -138,10 +185,50 @@ class CapsuleRenderer:
         y = self.focal_length * cam_points[:, 1] / z + self.height / 2.0
         return np.stack([x, y], axis=1)
 
-    # -- 렌더 ----------------------------------------------------------------
+    # -- 공통 기하 -------------------------------------------------------------
+
+    def _blank_canvas(self) -> np.ndarray:
+        return np.full((self.height, self.width, 3), BACKGROUND_COLOR, dtype=np.uint8)
+
+    def _head(self, pose: np.ndarray) -> _Head:
+        world = head_center(pose)
+        cam = self._camera_transform(world[np.newaxis, :])[0]
+        px = self._project(cam[np.newaxis, :])[0]
+        radius_px = max(4, int(self.focal_length * HEAD_RADIUS_METERS * self.face_scale / max(cam[2], 0.05)))
+        return _Head(world=world, cam=cam, px=px, radius_px=radius_px)
+
+    def _face_layout(self, face: np.ndarray, head: _Head) -> Optional[_FaceLayout]:
+        """얼굴 요소를 face_scale만큼 키워 투영하고, 머리 앞쪽 반구에 있는 것만 보이게 한다."""
+        face_world = head.world + (face - head.world) * self.face_scale
+        cam = self._camera_transform(face_world)
+        proj = self._project(cam)
+        # 머리 중심보다 카메라 쪽(앞 반구)에 있는 점만 보인다. 고개를 돌리면 먼 쪽 눈썹/눈이 사라진다.
+        visible = cam[:, 2] < head.cam[2]
+        if not np.any(visible):
+            return None
+        names = landmarks.FACE_KEY_ORDER
+        return _FaceLayout(
+            pts={name: proj[i].astype(np.int32) for i, name in enumerate(names)},
+            visible={name: bool(visible[i]) for i, name in enumerate(names)},
+        )
+
+    def _face_line_widths(self, head: _Head) -> Tuple[int, int, int]:
+        """(눈썹 굵기, 윤곽선 굵기, 코 점 반지름) — 머리 크기에 비례."""
+        return (
+            max(2, int(round(head.radius_px * BROW_THICKNESS_RATIO))),
+            max(1, int(round(head.radius_px * FACE_OUTLINE_RATIO))),
+            max(2, int(round(head.radius_px * NOSE_RADIUS_RATIO))),
+        )
+
+    def _advance_orbit(self) -> None:
+        self._orbit_accum += self.orbit_rad_per_frame
+
+
+class CapsuleRenderer(_ProjectedRenderer):
+    """캡슐형 팔다리 + 몸통 폴리곤 + 구형 머리로 이루어진 캐릭터를 그리는 렌더러 (조건 C)."""
 
     def render(self, frame: FrameData) -> np.ndarray:
-        img = np.full((self.height, self.width, 3), BACKGROUND_COLOR, dtype=np.uint8)
+        img = self._blank_canvas()
 
         cam_pose = self._camera_transform(frame.pose)
         proj_pose = self._project(cam_pose)
@@ -153,15 +240,9 @@ class CapsuleRenderer:
         primitives: List[_Primitive] = []
         primitives.extend(self._limb_primitives(frame.pose, cam_pose, proj_pose))
         primitives.extend(self._torso_primitives(frame.pose, cam_pose, proj_pose))
-        head_world = head_center(frame.pose)
-        head_cam = self._camera_transform(head_world[np.newaxis, :])[0]
-        head_px = self._project(head_cam[np.newaxis, :])[0]
-        head_radius_px = max(
-            4, int(self.focal_length * HEAD_RADIUS_METERS * self.face_scale / max(head_cam[2], 0.05))
-        )
-
-        primitives.extend(self._neck_primitive(cam_pose, proj_pose, head_px))
-        primitives.append(self._head_primitive(head_cam, head_px, head_radius_px))
+        head = self._head(frame.pose)
+        primitives.extend(self._neck_primitive(cam_pose, proj_pose, head.px))
+        primitives.append(self._head_primitive(head.cam, head.px, head.radius_px))
 
         if frame.left_hand is not None:
             primitives.extend(self._hand_primitives(frame.left_hand, "left"))
@@ -169,14 +250,13 @@ class CapsuleRenderer:
             primitives.extend(self._hand_primitives(frame.right_hand, "right"))
 
         if frame.face is not None:
-            face_world = head_world + (frame.face - head_world) * self.face_scale
-            primitives.extend(self._face_primitives(face_world, head_cam, head_radius_px))
+            primitives.extend(self._face_primitives(frame.face, head))
 
         primitives.sort(key=lambda p: p.depth, reverse=True)  # 먼 것부터 그려서 가까운 게 덮도록
         for prim in primitives:
             prim.draw_fn(img)
 
-        self._orbit_accum += self.orbit_rad_per_frame
+        self._advance_orbit()
         return img
 
     # -- 바닥 -----------------------------------------------------------------
@@ -330,56 +410,110 @@ class CapsuleRenderer:
         color = _side_color(f"{side}_hand" if side == "right" else "left_hand")
         base_color = _clamp_color(color)
 
-        wrist_px = tuple(proj[landmarks.HAND_WRIST].astype(int))
-
-        def draw(img, proj=proj, base_color=base_color, wrist_px=wrist_px):
-            for finger in landmarks.HAND_FINGERS:
-                prev_pt = wrist_px
-                for joint_idx in finger:
-                    pt = tuple(proj[joint_idx].astype(int))
-                    cv2.line(img, prev_pt, pt, base_color, FINGER_THICKNESS, cv2.LINE_AA)
-                    cv2.circle(img, pt, HAND_JOINT_RADIUS, base_color, -1, cv2.LINE_AA)
-                    prev_pt = pt
+        def draw(img, proj=proj, base_color=base_color):
+            _draw_hand_chains(img, proj, base_color)
 
         return [_Primitive(depth=depth, draw_fn=draw)]
 
     # -- 얼굴 (눈썹/눈/코/입) ----------------------------------------------------
 
-    def _face_primitives(
-        self, face_world: np.ndarray, head_cam: np.ndarray, head_radius_px: int
-    ) -> List[_Primitive]:
-        cam = self._camera_transform(face_world)
-        proj = self._project(cam)
-
-        # 머리 중심보다 카메라 쪽(앞 반구)에 있는 점만 보인다. 고개를 돌리면 먼 쪽 눈썹/눈이 사라진다.
-        visible = cam[:, 2] < head_cam[2]
-        if not np.any(visible):
+    def _face_primitives(self, face: np.ndarray, head: _Head) -> List[_Primitive]:
+        layout = self._face_layout(face, head)
+        if layout is None:
             return []
-
-        k = landmarks.FACE_KEY_ORDER.index
-        pts = {name: proj[k(name)].astype(np.int32) for name in landmarks.FACE_KEY_ORDER}
-        vis = {name: bool(visible[k(name)]) for name in landmarks.FACE_KEY_ORDER}
-
-        brow_thickness = max(2, int(round(head_radius_px * BROW_THICKNESS_RATIO)))
-        outline_thickness = max(1, int(round(head_radius_px * FACE_OUTLINE_RATIO)))
-        nose_radius = max(2, int(round(head_radius_px * NOSE_RADIUS_RATIO)))
-
-        def polygon(names):
-            if not all(vis[n] for n in names):
-                return None
-            return np.array([pts[n] for n in names], dtype=np.int32)
+        brow_thickness, outline_thickness, nose_radius = self._face_line_widths(head)
 
         def draw(img):
             for brow in (landmarks.LEFT_BROW_KEYS, landmarks.RIGHT_BROW_KEYS):
-                line = polygon(brow)
+                line = layout.polygon(brow)
                 if line is not None:
                     cv2.polylines(img, [line], False, FACE_COLOR, brow_thickness, cv2.LINE_AA)
             for outline in (landmarks.LEFT_EYE_OUTLINE, landmarks.RIGHT_EYE_OUTLINE, landmarks.MOUTH_OUTLINE):
-                poly = polygon(outline)
+                poly = layout.polygon(outline)
                 if poly is not None:
                     cv2.fillPoly(img, [poly], FACE_COLOR, cv2.LINE_AA)
                     cv2.polylines(img, [poly], True, FACE_COLOR, outline_thickness, cv2.LINE_AA)
-            if vis["nose_tip"]:
-                cv2.circle(img, tuple(int(v) for v in pts["nose_tip"]), nose_radius, FACE_COLOR, -1, cv2.LINE_AA)
+            if layout.visible["nose_tip"]:
+                cv2.circle(img, tuple(int(v) for v in layout.pts["nose_tip"]), nose_radius, FACE_COLOR, -1, cv2.LINE_AA)
 
-        return [_Primitive(depth=float(head_cam[2]) - FACE_DEPTH_EPSILON, draw_fn=draw)]
+        return [_Primitive(depth=float(head.cam[2]) - FACE_DEPTH_EPSILON, draw_fn=draw)]
+
+
+class SkeletonRenderer(_ProjectedRenderer):
+    """배경 위에 선과 점만으로 관절·손가락·얼굴을 그리는 렌더러 (조건 B).
+
+    CapsuleRenderer와 카메라·머리·얼굴 기하를 공유하므로 같은 프레임에서 관절이 같은 픽셀에 놓인다.
+    면(캡슐, 폴리곤), 바닥, 그림자는 그리지 않는다.
+    """
+
+    def render(self, frame: FrameData) -> np.ndarray:
+        img = self._blank_canvas()
+        proj_pose = self._project(self._camera_transform(frame.pose))
+        head = self._head(frame.pose)
+
+        def px(idx: int) -> Tuple[int, int]:
+            return tuple(int(v) for v in proj_pose[idx])
+
+        # 몸통 윤곽
+        torso = [landmarks.LEFT_SHOULDER, landmarks.RIGHT_SHOULDER, landmarks.RIGHT_HIP, landmarks.LEFT_HIP]
+        torso_color = _clamp_color(SKELETON_COLOR)
+        for a, b in zip(torso, torso[1:] + torso[:1]):
+            cv2.line(img, px(a), px(b), torso_color, SKELETON_LINE_THICKNESS, cv2.LINE_AA)
+
+        # 목: 어깨 중앙 → 머리 윤곽. 머리 중심까지 그으면 선이 얼굴(입)을 가로지른다.
+        shoulder_mid = (proj_pose[landmarks.LEFT_SHOULDER] + proj_pose[landmarks.RIGHT_SHOULDER]) / 2.0
+        to_shoulder = shoulder_mid - head.px
+        dist = float(np.linalg.norm(to_shoulder))
+        if dist > head.radius_px:
+            neck_top = head.px + to_shoulder / dist * head.radius_px
+            cv2.line(
+                img,
+                tuple(int(v) for v in shoulder_mid),
+                tuple(int(v) for v in neck_top),
+                torso_color,
+                SKELETON_LINE_THICKNESS,
+                cv2.LINE_AA,
+            )
+
+        # 팔다리
+        for start_idx, end_idx, part_name in landmarks.POSE_LIMB_SEGMENTS:
+            cv2.line(img, px(start_idx), px(end_idx), self._color(part_name), SKELETON_LINE_THICKNESS, cv2.LINE_AA)
+        for start_idx, end_idx, part_name in landmarks.POSE_LIMB_SEGMENTS:
+            for idx in (start_idx, end_idx):
+                cv2.circle(img, px(idx), SKELETON_JOINT_RADIUS, self._color(part_name), -1, cv2.LINE_AA)
+
+        # 머리 윤곽 + 얼굴
+        cv2.circle(img, tuple(int(v) for v in head.px), head.radius_px, torso_color, SKELETON_HEAD_OUTLINE, cv2.LINE_AA)
+        if frame.face is not None:
+            self._draw_face(img, frame.face, head)
+
+        # 손
+        for hand, side in ((frame.left_hand, "left"), (frame.right_hand, "right")):
+            if hand is not None:
+                _draw_hand_chains(img, self._project(self._camera_transform(hand)), self._color(side))
+
+        self._advance_orbit()
+        return img
+
+    @staticmethod
+    def _color(part_name: str) -> Tuple[int, int, int]:
+        dim = SKELETON_LEFT_DIM if part_name.startswith("left") else 1.0
+        return _clamp_color(SKELETON_COLOR * dim)
+
+    def _draw_face(self, img: np.ndarray, face: np.ndarray, head: _Head) -> None:
+        layout = self._face_layout(face, head)
+        if layout is None:
+            return
+        brow_thickness, outline_thickness, nose_radius = self._face_line_widths(head)
+        color = _clamp_color(SKELETON_COLOR)
+        for brow in (landmarks.LEFT_BROW_KEYS, landmarks.RIGHT_BROW_KEYS):
+            line = layout.polygon(brow)
+            if line is not None:
+                cv2.polylines(img, [line], False, color, brow_thickness, cv2.LINE_AA)
+        # 눈·입은 채우지 않고 윤곽선만 (입 벌림은 윤곽의 높이로 보인다)
+        for outline in (landmarks.LEFT_EYE_OUTLINE, landmarks.RIGHT_EYE_OUTLINE, landmarks.MOUTH_OUTLINE):
+            poly = layout.polygon(outline)
+            if poly is not None:
+                cv2.polylines(img, [poly], True, color, max(outline_thickness, 2), cv2.LINE_AA)
+        if layout.visible["nose_tip"]:
+            cv2.circle(img, tuple(int(v) for v in layout.pts["nose_tip"]), nose_radius, color, -1, cv2.LINE_AA)

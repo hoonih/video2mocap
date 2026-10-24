@@ -1,10 +1,12 @@
 import os
 
+import cv2
 import numpy as np
+import pytest
 
 from mocap import landmarks
-from mocap.renderer import FACE_COLOR, CapsuleRenderer
-from mocap.retarget import FrameData, face_to_world, head_center
+from mocap.renderer import BACKGROUND_COLOR, FACE_COLOR, CapsuleRenderer, SkeletonRenderer
+from mocap.retarget import FrameData, face_to_world, head_center, synthesize_lower_body
 
 from .face_fixture import canonical_face_pixel
 
@@ -177,3 +179,80 @@ def test_face_scale_enlarges_head_and_face_together():
     small = CapsuleRenderer(width=720, height=1280, upper_body=True, face_scale=1.0).render(FrameData(pose=pose, face=face))
     large = CapsuleRenderer(width=720, height=1280, upper_body=True, face_scale=1.4).render(FrameData(pose=pose, face=face))
     assert len(_face_pixels(large)[0]) > len(_face_pixels(small)[0]) * 1.6  # 면적은 대략 배율의 제곱
+
+
+# --- 골격 렌더러 (조건 B, Phase 2) -------------------------------------------------
+
+def _signing_frame() -> FrameData:
+    pose = _full_body_pose()
+    return FrameData(
+        pose=pose,
+        left_hand=_fake_hand(pose[landmarks.LEFT_WRIST]),
+        right_hand=_fake_hand(pose[landmarks.RIGHT_WRIST]),
+        face=_real_face(pose, mouth_open_cm=1.0),
+    )
+
+
+def _foreground(img, include_face_color=False):
+    mask = np.abs(img.astype(int) - np.array(BACKGROUND_COLOR)).sum(axis=2) > 30
+    if include_face_color:
+        mask |= np.all(img == np.array(FACE_COLOR, dtype=np.uint8), axis=2)
+    return mask
+
+
+@pytest.mark.parametrize("upper_body, yaw", [(True, 0.0), (True, 25.0), (False, -15.0)])
+def test_skeleton_and_avatar_share_camera(upper_body, yaw):
+    kwargs = dict(width=360, height=640, upper_body=upper_body, yaw_deg=yaw)
+    avatar, skeleton = CapsuleRenderer(**kwargs), SkeletonRenderer(**kwargs)
+    pose = _full_body_pose()
+
+    for attr in ("camera_distance", "camera_height", "focal_length", "yaw_rad", "face_scale", "width", "height"):
+        assert getattr(avatar, attr) == getattr(skeleton, attr), attr
+    assert np.array_equal(
+        avatar._project(avatar._camera_transform(pose)), skeleton._project(skeleton._camera_transform(pose))
+    )
+
+
+def test_skeleton_lies_inside_avatar_silhouette():
+    """같은 프레임에서 골격의 모든 픽셀이 아바타 실루엣(얼굴 요소 포함) 안에 있어야 한다."""
+    frame = _signing_frame()
+    kwargs = dict(width=720, height=1280, upper_body=True)
+    avatar_img = CapsuleRenderer(**kwargs).render(frame)
+    skeleton_img = SkeletonRenderer(**kwargs).render(frame)
+
+    avatar_mask = _foreground(avatar_img, include_face_color=True).astype(np.uint8)
+    avatar_mask = cv2.dilate(avatar_mask, np.ones((5, 5), np.uint8)) > 0  # 안티에일리어싱 가장자리 허용
+    skeleton_mask = _foreground(skeleton_img)
+
+    assert skeleton_mask.sum() > 1000
+    assert (skeleton_mask & ~avatar_mask).sum() == 0
+
+
+def test_skeleton_has_no_filled_surfaces_or_floor():
+    frame = _signing_frame()
+    img = SkeletonRenderer(width=720, height=1280, upper_body=False).render(frame)
+    colors = img.reshape(-1, 3)
+    # 회색조만 쓴다 (아바타의 파란 면, 바닥 격자 색이 없어야 함)
+    spread = colors.max(axis=1).astype(int) - colors.min(axis=1).astype(int)
+    assert spread.max() <= 4
+    # 선과 점만이므로 전경 비율이 아바타보다 훨씬 작다
+    avatar = CapsuleRenderer(width=720, height=1280, upper_body=False).render(frame)
+    assert _foreground(img).mean() < _foreground(avatar).mean() * 0.5
+
+
+def test_skeleton_shows_brow_and_mouth_changes():
+    pose = landmarks.build_neutral_pose()
+    renderer = SkeletonRenderer(width=720, height=1280, upper_body=True)
+
+    def render(**expression):
+        return renderer.render(FrameData(pose=pose, face=_real_face(pose, **expression)))
+
+    assert not np.array_equal(render(brow_raise_cm=0.8), render(brow_raise_cm=-0.5))
+    assert not np.array_equal(render(), render(mouth_open_cm=1.5))
+
+
+def test_upper_body_torso_is_not_crossed():
+    """회귀: 하체 템플릿 좌우가 MediaPipe와 반대여서 몸통이 나비넥타이 모양으로 꼬이던 버그."""
+    pose = synthesize_lower_body(landmarks.build_neutral_pose())
+    assert pose[landmarks.LEFT_HIP, 0] > pose[landmarks.RIGHT_HIP, 0]
+    assert pose[landmarks.LEFT_SHOULDER, 0] > pose[landmarks.RIGHT_SHOULDER, 0]

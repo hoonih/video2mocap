@@ -10,7 +10,7 @@ from typing import List, Optional
 import numpy as np
 
 from . import landmarks, retarget, video_io
-from .renderer import DEFAULT_FACE_SCALE, CapsuleRenderer
+from .renderer import DEFAULT_FACE_SCALE, CapsuleRenderer, SkeletonRenderer
 from .smoothing import EMASmoother
 from .tracker import HolisticTracker, draw_landmarks_overlay
 
@@ -33,9 +33,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--view",
-        choices=["side", "avatar"],
+        choices=["side", "avatar", "skeleton"],
         default="side",
-        help="side: 원본과 캐릭터를 나란히 출력, avatar: 캐릭터만 출력 (기본값: side)",
+        help=(
+            "side: 원본과 캐릭터를 나란히 출력, avatar: 캐릭터만 출력(조건 C), "
+            "skeleton: 선과 점으로 된 골격만 출력(조건 B) (기본값: side)"
+        ),
     )
     parser.add_argument("--yaw", type=float, default=0.0, help="카메라 좌우 회전 각도(도), 기본값 0")
     parser.add_argument(
@@ -105,7 +108,8 @@ def run(args: argparse.Namespace) -> int:
     out_path = args.out or _default_output_path(args.input)
     info = video_io.get_video_info(args.input)
 
-    renderer = CapsuleRenderer(
+    renderer_cls = SkeletonRenderer if args.view == "skeleton" else CapsuleRenderer
+    renderer = renderer_cls(
         width=info.width,
         height=info.height,
         upper_body=args.upper_body,
@@ -128,7 +132,8 @@ def run(args: argparse.Namespace) -> int:
     face_ref: Optional[tuple] = None
 
     print(f"입력: {args.input} ({info.width}x{info.height}, {info.fps:.1f}fps, {info.total_frames}프레임)")
-    print(f"출력: {out_path} ({'나란히 보기' if args.view == 'side' else '캐릭터만 보기'})")
+    view_label = {"side": "나란히 보기", "avatar": "캐릭터만 보기", "skeleton": "골격만 보기"}[args.view]
+    print(f"출력: {out_path} ({view_label})")
 
     with HolisticTracker(model_complexity=args.complexity) as tracker, video_io.VideoWriter(
         out_path, fps=info.fps, size=(output_width, info.height)
