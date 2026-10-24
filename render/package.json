@@ -1,0 +1,17 @@
+{
+  "name": "video2mocap-render",
+  "private": true,
+  "description": "조건 B·C 오프라인 렌더러: three.js + three-vrm 씬을 헤드리스 Chromium에서 프레임 단위로 렌더한다",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/scene.js --bundle --format=iife --global-name=AvatarScene --outfile=dist/scene.js"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "3.5.5",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "playwright": "1.63.0"
+  }
+}
