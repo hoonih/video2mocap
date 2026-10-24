@@ -6,6 +6,9 @@
 
 ## 설치
 
+**ffmpeg가 필요합니다** (`brew install ffmpeg` / `sudo apt install ffmpeg`). 입력 디코딩에 씁니다.
+
+
 Python 3.9~3.12 환경을 권장합니다.
 
 ```bash
@@ -30,12 +33,17 @@ python -m mocap input.mp4
 |---|---|---|
 | `--out 경로.mp4` | 출력 영상 경로 | `<입력파일명>_mocap.mp4` |
 | `--upper-body` | 상체 모드 (가슴 위만 나오는 영상용) | 꺼짐 |
-| `--view side\|avatar\|skeleton` | `side`: 원본+캐릭터 나란히, `avatar`: 캐릭터만(조건 C), `skeleton`: 선과 점으로 된 골격만(조건 B) | `side` |
+| `--view side\|avatar\|skeleton\|original` | `side`: 정규화한 원본(랜드마크 표시)+캐릭터 나란히, `avatar`: 캐릭터만(조건 C), `skeleton`: 선과 점으로 된 골격만(조건 B), `original`: 원본을 같은 크기·위치로 정규화(조건 A) | `side` |
 | `--yaw 각도` | 카메라 좌우 회전 각도(도) | `0` |
 | `--orbit 각도` | 프레임마다 추가로 회전할 각도(도/프레임) | `0` |
 | `--smooth 0.0~0.9` | 떨림 보정 강도 (클수록 부드럽지만 반응 느려짐) | `0.3` |
 | `--complexity 0\|1\|2` | MediaPipe 모델 복잡도 (높을수록 정확하지만 느림) | `1` |
-| `--max-height 픽셀` | 처리용 프레임 최대 세로 크기 (큰 영상은 축소) | `720` |
+| `--max-height 픽셀` | 추적용 프레임 최대 세로 크기 (출력 크기와 무관) | `720` |
+| `--output-size WxH` | 출력 해상도. 모든 조건이 이 크기로 나옴 | `720x1280` |
+| `--fps 값` | 출력 고정 프레임레이트 (입력이 29.97·가변이어도 맞춤) | `30` |
+| `--shoulder-ratio 비율` | 정면 어깨너비가 화면 폭에서 차지할 비율 | `0.35` |
+| `--anchor-y 비율` | 어깨 중앙의 세로 위치 (0=위, 1=아래) | `0.42` |
+| `--show-legs` | 상체 모드에서도 합성 다리를 그림 | 꺼짐(다리 숨김) |
 | `--face-scale 배율` | 머리·얼굴 확대 배율 (표정 판독용) | `1.4` |
 | `--export-json 경로.json` | 프레임별 3D 관절 좌표를 JSON으로 저장 | 없음 |
 

@@ -104,6 +104,15 @@ def _side_color(part_name: str) -> np.ndarray:
 
 
 @dataclass
+class CameraFraming:
+    """렌더러 카메라 배치. None이면 상체/전신 모드 기본값을 쓴다 (framing.camera_for_target 참고)."""
+
+    distance: float
+    height: float
+    shift_x: float = 0.0
+
+
+@dataclass
 class _Head:
     """머리 구의 위치와 화면상 크기. 모든 렌더러가 같은 값을 쓴다."""
 
@@ -154,6 +163,8 @@ class _ProjectedRenderer:
         yaw_deg: float = 0.0,
         orbit_deg_per_frame: float = 0.0,
         face_scale: float = DEFAULT_FACE_SCALE,
+        camera: Optional[CameraFraming] = None,
+        hide_legs: bool = False,
     ) -> None:
         self.width = width
         self.height = height
@@ -163,8 +174,16 @@ class _ProjectedRenderer:
         self._orbit_accum = 0.0
         self.face_scale = face_scale
 
-        self.camera_distance = UPPER_BODY_CAMERA_DISTANCE if upper_body else FULL_BODY_CAMERA_DISTANCE
-        self.camera_height = UPPER_BODY_CAMERA_HEIGHT if upper_body else FULL_BODY_CAMERA_HEIGHT
+        self.hide_legs = hide_legs
+        if camera is None:
+            camera = CameraFraming(
+                distance=UPPER_BODY_CAMERA_DISTANCE if upper_body else FULL_BODY_CAMERA_DISTANCE,
+                height=UPPER_BODY_CAMERA_HEIGHT if upper_body else FULL_BODY_CAMERA_HEIGHT,
+            )
+        self.camera_distance = camera.distance
+        self.camera_height = camera.height
+        self.camera_shift_x = camera.shift_x
+        self._frame_shift = np.zeros(2)  # 프레임별 화면 이동 (FrameData.screen_anchor)
         self.focal_length = height * FOCAL_LENGTH_FACTOR
 
     # -- 카메라/투영 ---------------------------------------------------------
@@ -174,6 +193,7 @@ class _ProjectedRenderer:
         rot = _rotation_y(self.yaw_rad + self._orbit_accum)
         rotated = points @ rot.T
         cam = rotated.copy()
+        cam[:, 0] += self.camera_shift_x
         cam[:, 1] += self.camera_height
         cam[:, 2] += self.camera_distance
         return cam
@@ -181,13 +201,19 @@ class _ProjectedRenderer:
     def _project(self, cam_points: np.ndarray) -> np.ndarray:
         """카메라 공간 좌표를 화면 픽셀 좌표(N,2)로 원근 투영한다."""
         z = np.clip(cam_points[:, 2], 0.05, None)
-        x = self.focal_length * cam_points[:, 0] / z + self.width / 2.0
-        y = self.focal_length * cam_points[:, 1] / z + self.height / 2.0
+        x = self.focal_length * cam_points[:, 0] / z + self.width / 2.0 + self._frame_shift[0]
+        y = self.focal_length * cam_points[:, 1] / z + self.height / 2.0 + self._frame_shift[1]
         return np.stack([x, y], axis=1)
 
     # -- 공통 기하 -------------------------------------------------------------
 
-    def _blank_canvas(self) -> np.ndarray:
+    def _begin_frame(self, frame: FrameData) -> np.ndarray:
+        """프레임별 화면 이동을 정하고 빈 캔버스를 돌려준다. 모든 render()의 첫 단계."""
+        self._frame_shift = np.zeros(2)
+        if frame.screen_anchor is not None:
+            shoulders = frame.pose[[landmarks.LEFT_SHOULDER, landmarks.RIGHT_SHOULDER]]
+            mid_px = self._project(self._camera_transform(shoulders)).mean(axis=0)
+            self._frame_shift = np.asarray(frame.screen_anchor, dtype=np.float64) - mid_px
         return np.full((self.height, self.width, 3), BACKGROUND_COLOR, dtype=np.uint8)
 
     def _head(self, pose: np.ndarray) -> _Head:
@@ -220,6 +246,10 @@ class _ProjectedRenderer:
             max(2, int(round(head.radius_px * NOSE_RADIUS_RATIO))),
         )
 
+    def _limb_segments(self):
+        """그릴 팔다리 세그먼트. hide_legs면 다리를 뺀다 (상체 모드의 합성 다리는 방해 요소)."""
+        return [seg for seg in landmarks.POSE_LIMB_SEGMENTS if not (self.hide_legs and seg[2].endswith("_leg"))]
+
     def _advance_orbit(self) -> None:
         self._orbit_accum += self.orbit_rad_per_frame
 
@@ -228,7 +258,7 @@ class CapsuleRenderer(_ProjectedRenderer):
     """캡슐형 팔다리 + 몸통 폴리곤 + 구형 머리로 이루어진 캐릭터를 그리는 렌더러 (조건 C)."""
 
     def render(self, frame: FrameData) -> np.ndarray:
-        img = self._blank_canvas()
+        img = self._begin_frame(frame)
 
         cam_pose = self._camera_transform(frame.pose)
         proj_pose = self._project(cam_pose)
@@ -307,7 +337,7 @@ class CapsuleRenderer(_ProjectedRenderer):
         self, pose: np.ndarray, cam_pose: np.ndarray, proj_pose: np.ndarray
     ) -> List[_Primitive]:
         prims = []
-        for start_idx, end_idx, part_name in landmarks.POSE_LIMB_SEGMENTS:
+        for start_idx, end_idx, part_name in self._limb_segments():
             depth = float((cam_pose[start_idx, 2] + cam_pose[end_idx, 2]) / 2.0)
             p1 = tuple(proj_pose[start_idx].astype(int))
             p2 = tuple(proj_pose[end_idx].astype(int))
@@ -447,7 +477,7 @@ class SkeletonRenderer(_ProjectedRenderer):
     """
 
     def render(self, frame: FrameData) -> np.ndarray:
-        img = self._blank_canvas()
+        img = self._begin_frame(frame)
         proj_pose = self._project(self._camera_transform(frame.pose))
         head = self._head(frame.pose)
 
@@ -476,9 +506,9 @@ class SkeletonRenderer(_ProjectedRenderer):
             )
 
         # 팔다리
-        for start_idx, end_idx, part_name in landmarks.POSE_LIMB_SEGMENTS:
+        for start_idx, end_idx, part_name in self._limb_segments():
             cv2.line(img, px(start_idx), px(end_idx), self._color(part_name), SKELETON_LINE_THICKNESS, cv2.LINE_AA)
-        for start_idx, end_idx, part_name in landmarks.POSE_LIMB_SEGMENTS:
+        for start_idx, end_idx, part_name in self._limb_segments():
             for idx in (start_idx, end_idx):
                 cv2.circle(img, px(idx), SKELETON_JOINT_RADIUS, self._color(part_name), -1, cv2.LINE_AA)
 

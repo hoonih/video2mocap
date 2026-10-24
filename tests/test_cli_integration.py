@@ -6,7 +6,12 @@ import numpy as np
 import pytest
 
 from mocap.cli import build_arg_parser, run
-from mocap.video_io import get_video_info
+from mocap.video_io import get_video_info, probe_video, read_frames_cfr
+
+
+def _count_frames(path: str) -> int:
+    return sum(1 for _ in read_frames_cfr(path, 30.0))
+
 
 mp_available = True
 try:
@@ -52,12 +57,12 @@ def test_cli_end_to_end_side_view_with_json_export(tmp_path, dummy_video):
     assert os.path.getsize(out_path) > 0
 
     out_info = get_video_info(out_path)
-    in_info = get_video_info(dummy_video)
-    assert out_info.width == in_info.width * 2  # side-by-side라 가로 2배
+    assert (out_info.width, out_info.height) == (720 * 2, 1280)  # side-by-side라 가로 2배
 
     with open(json_path, "r", encoding="utf-8") as f:
         records = json.load(f)
-    assert len(records) == in_info.total_frames
+    # 입력(10fps, 6프레임 = 0.6초)을 30fps로 고정 변환한 프레임 수
+    assert len(records) == _count_frames(dummy_video) == _count_frames(out_path)
     for rec in records:
         assert len(rec["pose"]) == 33
         assert len(rec["pose"][0]) == 3
@@ -85,8 +90,29 @@ def test_cli_end_to_end_avatar_view_upper_body(tmp_path, dummy_video):
     assert os.path.exists(out_path)
 
     out_info = get_video_info(out_path)
-    in_info = get_video_info(dummy_video)
-    assert out_info.width == in_info.width  # avatar만 출력하므로 원본 폭과 동일
+    assert (out_info.width, out_info.height) == (720, 1280)  # 출력 크기는 입력과 무관하게 고정
+
+
+def test_cli_all_conditions_share_size_fps_and_frame_count(tmp_path, dummy_video):
+    """조건 A·B·C의 해상도·fps·프레임 수가 같아야 한다 (교란변인 방지)."""
+    parser = build_arg_parser()
+    infos = []
+    for view in ("original", "skeleton", "avatar"):
+        out_path = str(tmp_path / f"out_{view}.mp4")
+        args = parser.parse_args(
+            [dummy_video, "--out", out_path, "--view", view, "--upper-body", "--complexity", "0",
+             "--output-size", "180x320"]
+        )
+        assert run(args) == 0
+        probe = probe_video(out_path)
+        infos.append((probe.width, probe.height, round(probe.fps, 3), _count_frames(out_path)))
+    assert infos[0] == infos[1] == infos[2]
+    assert infos[0][:3] == (180, 320, 30.0)
+
+
+def test_cli_invalid_output_size_returns_error(dummy_video):
+    parser = build_arg_parser()
+    assert run(parser.parse_args([dummy_video, "--output-size", "720"])) == 1
 
 
 def test_cli_missing_input_returns_error(tmp_path):

@@ -22,6 +22,9 @@ class FrameData:
     left_hand: Optional[np.ndarray] = None   # (21, 3) meters
     right_hand: Optional[np.ndarray] = None  # (21, 3) meters
     face: Optional[np.ndarray] = None        # (N, 3) meters, landmarks.FACE_KEY_ORDER 순서
+    # 출력 화면에서 어깨 중앙이 놓일 픽셀 위치. 조건 A(원본)에서 화자가 움직인 만큼 B·C도 옮긴다.
+    # None이면 카메라 기본 배치를 그대로 쓴다.
+    screen_anchor: Optional[np.ndarray] = None
 
 
 def assign_hands(

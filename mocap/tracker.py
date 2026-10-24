@@ -43,6 +43,11 @@ def _world_landmarks_to_array(landmark_list) -> np.ndarray:
     return np.array([(lm.x, lm.y, lm.z) for lm in landmark_list.landmark], dtype=np.float64)
 
 
+# 디버그 오버레이용 연결 정보 (mediapipe 상수를 순수 튜플로 꺼내 둔다)
+POSE_CONNECTIONS = tuple(tuple(c) for c in mp.solutions.holistic.POSE_CONNECTIONS)
+HAND_CONNECTIONS = tuple(tuple(c) for c in mp.solutions.holistic.HAND_CONNECTIONS)
+
+
 class HolisticTracker:
     """mediapipe Holistic을 감싸 프레임별로 RawLandmarks를 만들어주는 클래스."""
 

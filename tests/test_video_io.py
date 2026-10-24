@@ -4,13 +4,20 @@ import cv2
 import numpy as np
 import pytest
 
+import shutil
+import subprocess
+
 from mocap.video_io import (
     VideoWriter,
     get_video_info,
+    probe_video,
     read_frames,
+    read_frames_cfr,
     resize_to_max_height,
     side_by_side,
 )
+
+needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg 없음")
 
 
 @pytest.fixture()
@@ -85,3 +92,29 @@ def test_side_by_side_matches_heights_and_concatenates_width():
     # 오른쪽 이미지는 높이 100에 맞춰 리사이즈된 폭이어야 함
     expected_right_w = round(60 * (100 / 80))
     assert combined.shape[1] == 50 + expected_right_w
+
+
+@needs_ffmpeg
+def test_read_frames_cfr_converts_frame_rate(dummy_video):
+    # 24fps 10프레임(0.4167초) → 30fps
+    frames = list(read_frames_cfr(dummy_video, 30.0))
+    assert len(frames) in (12, 13)
+    assert frames[0].shape == (120, 160, 3)
+
+
+@needs_ffmpeg
+def test_probe_and_decode_respect_rotation_metadata(tmp_path):
+    """스마트폰 세로 촬영본: 저장은 가로(64x48)지만 회전 메타데이터로 세로(48x64)로 표시된다."""
+    plain, rotated = str(tmp_path / "plain.mp4"), str(tmp_path / "rotated.mp4")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30", "-t", "0.2",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", plain],
+        check=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-display_rotation:v:0", "90", "-i", plain, "-c", "copy", rotated],
+        check=True,
+    )
+    info = probe_video(rotated)
+    assert (info.width, info.height) == (48, 64)
+    assert next(read_frames_cfr(rotated, 30.0, info)).shape == (64, 48, 3)
