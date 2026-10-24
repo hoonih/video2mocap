@@ -5,8 +5,10 @@ drawing_utils)가 빠져 있을 수 있으므로 반드시 이 버전을 사용�
 """
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -28,6 +30,8 @@ class RawLandmarks:
     right_hand_pixel: Optional[np.ndarray]  # (21, 3)
     face_pixel: Optional[np.ndarray]        # (468 또는 478, 3)
     image_size: Tuple[int, int]             # (width, height)
+    # Face Landmarker(Tasks API)의 ARKit 호환 블렌드셰이프 계수 0~1. 폴백 경로에서는 None.
+    face_blendshapes: Optional[Dict[str, float]] = None
 
 
 def _landmarks_to_array(landmark_list, width: int, height: int, use_pixel_z: bool = True) -> np.ndarray:
@@ -41,6 +45,82 @@ def _landmarks_to_array(landmark_list, width: int, height: int, use_pixel_z: boo
 
 def _world_landmarks_to_array(landmark_list) -> np.ndarray:
     return np.array([(lm.x, lm.y, lm.z) for lm in landmark_list.landmark], dtype=np.float64)
+
+
+DEFAULT_FACE_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "models", "face_landmarker.task"
+)
+
+
+class FaceBlendshapeTracker:
+    """MediaPipe Tasks API FaceLandmarker(VIDEO 모드) 래퍼: 얼굴 478점 + 블렌드셰이프 52개.
+
+    VIDEO 모드는 프레임 간 추적을 쓰므로 타임스탬프가 단조 증가해야 한다. 같은 입력이면 결과가 같다.
+    """
+
+    def __init__(self, model_path: str) -> None:
+        from mediapipe.tasks.python import BaseOptions, vision
+
+        options = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            output_face_blendshapes=True,
+        )
+        self._landmarker = vision.FaceLandmarker.create_from_options(options)
+
+    def process(
+        self, frame_bgr: np.ndarray, timestamp_ms: int, pixel_size: Tuple[int, int]
+    ) -> Tuple[Optional[np.ndarray], Optional[Dict[str, float]]]:
+        """(얼굴 점 (N,3), 블렌드셰이프 dict)를 돌려준다. 점은 pixel_size 기준 픽셀 좌표(z*W)로 맞춘다.
+
+        frame_bgr는 원본 해상도를 넣는다 (눈썹 정밀도가 얼굴 해상도에 좌우됨). 좌표는 정규화 값이라
+        추적용 프레임 크기(pixel_size)로 바로 바꿀 수 있다.
+        """
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame_bgr[:, :, ::-1]))
+        result = self._landmarker.detect_for_video(image, timestamp_ms)
+        if not result.face_landmarks:
+            return None, None
+        width, height = pixel_size
+        points = np.array(
+            [(lm.x * width, lm.y * height, lm.z * width) for lm in result.face_landmarks[0]], dtype=np.float64
+        )
+        blendshapes = None
+        if result.face_blendshapes:
+            blendshapes = {
+                c.category_name: float(c.score) for c in result.face_blendshapes[0] if c.category_name != "_neutral"
+            }
+        return points, blendshapes
+
+    def close(self) -> None:
+        self._landmarker.close()
+
+    def __enter__(self) -> "FaceBlendshapeTracker":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+
+def create_face_tracker(model_path: Optional[str]) -> Optional[FaceBlendshapeTracker]:
+    """블렌드셰이프 추적기를 만든다. 쓸 수 없으면(모델 파일 없음, Tasks API 없음) 경고 후 None.
+
+    None이면 Holistic 얼굴 468점 좌표만 쓰는 기존 경로로 동작한다.
+    """
+    if model_path is None:
+        return None
+    if not os.path.exists(model_path):
+        print(
+            f"경고: 얼굴 블렌드셰이프 모델이 없습니다: {model_path}\n"
+            "  Holistic 얼굴 좌표로 대신합니다 (블렌드셰이프 없음). 받는 방법은 assets/models/README.md 참고.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return FaceBlendshapeTracker(model_path)
+    except Exception as exc:  # Tasks API가 없는 빌드 등
+        print(f"경고: Face Landmarker를 쓸 수 없어 Holistic 얼굴 좌표로 대신합니다: {exc}", file=sys.stderr)
+        return None
 
 
 # 디버그 오버레이용 연결 정보 (mediapipe 상수를 순수 튜플로 꺼내 둔다)

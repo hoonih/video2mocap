@@ -110,6 +110,21 @@ FACE_KEY_INDICES = {
 # FrameData.face 배열에서의 순서 (face_to_world의 출력 순서와 일치해야 함)
 FACE_KEY_ORDER = tuple(FACE_KEY_INDICES)
 
+# Face Landmarker 블렌드셰이프 이름 (ARKit 52개 중 '_neutral' 제외 51개, FrameData 저장 순서)
+BLENDSHAPE_NAMES = (
+    "browDownLeft", "browDownRight", "browInnerUp", "browOuterUpLeft", "browOuterUpRight",
+    "cheekPuff", "cheekSquintLeft", "cheekSquintRight",
+    "eyeBlinkLeft", "eyeBlinkRight", "eyeLookDownLeft", "eyeLookDownRight", "eyeLookInLeft", "eyeLookInRight",
+    "eyeLookOutLeft", "eyeLookOutRight", "eyeLookUpLeft", "eyeLookUpRight", "eyeSquintLeft", "eyeSquintRight",
+    "eyeWideLeft", "eyeWideRight",
+    "jawForward", "jawLeft", "jawOpen", "jawRight",
+    "mouthClose", "mouthDimpleLeft", "mouthDimpleRight", "mouthFrownLeft", "mouthFrownRight", "mouthFunnel",
+    "mouthLeft", "mouthLowerDownLeft", "mouthLowerDownRight", "mouthPressLeft", "mouthPressRight", "mouthPucker",
+    "mouthRight", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper",
+    "mouthSmileLeft", "mouthSmileRight", "mouthStretchLeft", "mouthStretchRight",
+    "mouthUpperUpLeft", "mouthUpperUpRight", "noseSneerLeft", "noseSneerRight",
+)
+
 # 얼굴 메시에서 머리 중심으로 쓰는 점: 양쪽 얼굴 가장자리(귀 앞)의 3D 중점.
 # FaceMesh의 z 원점은 얼굴 앞면 근처라서 코끝 z는 이 중점보다 약 10cm 앞에 있다.
 FACE_CENTER_KEYS = ("face_left_edge", "face_right_edge")

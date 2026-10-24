@@ -66,6 +66,35 @@ def test_cli_end_to_end_side_view_with_json_export(tmp_path, dummy_video):
     for rec in records:
         assert len(rec["pose"]) == 33
         assert len(rec["pose"][0]) == 3
+        assert "face_blendshapes" in rec  # 사람이 없는 영상이라 값은 None
+
+
+def test_retargeter_smooths_and_holds_blendshapes():
+    from mocap import landmarks
+    from mocap.cli import _Retargeter
+    from mocap.tracker import RawLandmarks
+
+    def raw(blendshapes):
+        return RawLandmarks(
+            pose_world=landmarks.build_neutral_pose(), pose_pixel=None, left_hand_pixel=None,
+            right_hand_pixel=None, face_pixel=None, image_size=(100, 100), face_blendshapes=blendshapes,
+        )
+
+    rt = _Retargeter(upper_body=True, smooth=0.5)
+    first = rt.step(raw({"browInnerUp": 0.8, "jawOpen": 0.2}))
+    assert first.face_blendshapes["browInnerUp"] == pytest.approx(0.8)  # 첫 값은 그대로 (증폭 없음)
+    assert first.face_blendshapes["browDownLeft"] == 0.0
+    assert len(first.face_blendshapes) == len(landmarks.BLENDSHAPE_NAMES)
+    nxt = rt.step(raw({"browInnerUp": 0.0}))
+    assert nxt.face_blendshapes["browInnerUp"] == pytest.approx(0.4)  # 연속 검출 사이는 EMA
+    held = rt.step(raw(None))
+    assert held.face_blendshapes["browInnerUp"] == pytest.approx(0.4)  # 미검출은 유지
+    back = rt.step(raw({"browInnerUp": 0.6}))
+    assert back.face_blendshapes["browInnerUp"] == pytest.approx(0.6)  # 재검출 첫 프레임은 리셋 (EMASmoother 규칙)
+
+
+def test_default_face_scale_is_one():
+    assert build_arg_parser().parse_args(["x.mp4"]).face_scale == 1.0
 
 
 def test_cli_end_to_end_avatar_view_upper_body(tmp_path, dummy_video):

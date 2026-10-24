@@ -20,7 +20,13 @@ from .renderer import (
     SkeletonRenderer,
 )
 from .smoothing import EMASmoother
-from .tracker import HAND_CONNECTIONS, POSE_CONNECTIONS, HolisticTracker
+from .tracker import (
+    DEFAULT_FACE_MODEL_PATH,
+    HAND_CONNECTIONS,
+    POSE_CONNECTIONS,
+    HolisticTracker,
+    create_face_tracker,
+)
 
 DEFAULT_SMOOTH_ALPHA = 0.3
 
@@ -88,6 +94,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"어깨 중앙의 세로 위치 비율 (0=위, 1=아래, 기본값 {framing.DEFAULT_ANCHOR[1]})",
     )
     parser.add_argument(
+        "--face-model",
+        default=DEFAULT_FACE_MODEL_PATH,
+        help="MediaPipe Face Landmarker 모델(.task) 경로. 없으면 Holistic 얼굴 좌표로 대신 (블렌드셰이프 없음)",
+    )
+    parser.add_argument(
+        "--no-blendshapes",
+        action="store_true",
+        help="Face Landmarker를 쓰지 않고 Holistic 얼굴 좌표만 쓴다 (폴백 경로 강제)",
+    )
+    parser.add_argument(
         "--show-legs",
         action="store_true",
         help="상체 모드에서도 합성 다리를 그린다 (기본값: 상체 모드에서는 다리를 숨김)",
@@ -116,6 +132,7 @@ def _frame_data_to_json_record(frame_index: int, frame: retarget.FrameData) -> d
         "left_hand": frame.left_hand.tolist() if frame.left_hand is not None else None,
         "right_hand": frame.right_hand.tolist() if frame.right_hand is not None else None,
         "face": frame.face.tolist() if frame.face is not None else None,
+        "face_blendshapes": frame.face_blendshapes,
     }
 
 
@@ -137,6 +154,7 @@ class _Retargeter:
         self.left_hand_smoother = EMASmoother(alpha=smooth)
         self.right_hand_smoother = EMASmoother(alpha=smooth)
         self.face_smoother = EMASmoother(alpha=smooth)
+        self.blendshape_smoother = EMASmoother(alpha=smooth)
         self.prev_frame_data: Optional[retarget.FrameData] = None
         self.last_scale: Optional[float] = None
         # 마지막으로 검출된 얼굴(머리 중심 기준 오프셋)과 그때의 머리 회전. 손이 얼굴을 가리는
@@ -188,6 +206,16 @@ class _Retargeter:
         frame_data = retarget.hold_missing(
             self.prev_frame_data, smoothed_pose, smoothed_left, smoothed_right, smoothed_face
         )
+        # 블렌드셰이프도 다른 부위와 같은 EMA로 떨림만 줄인다 (증폭 없음). 미검출 프레임은 직전 값 유지.
+        coeffs = None
+        if raw.face_blendshapes is not None:
+            coeffs = np.array([raw.face_blendshapes.get(n, 0.0) for n in landmarks.BLENDSHAPE_NAMES])
+        smoothed_coeffs = self.blendshape_smoother.update(coeffs)
+        if smoothed_coeffs is not None:
+            frame_data = replace(
+                frame_data,
+                face_blendshapes={n: float(v) for n, v in zip(landmarks.BLENDSHAPE_NAMES, smoothed_coeffs)},
+            )
         self.prev_frame_data = frame_data
         return frame_data
 
@@ -203,22 +231,45 @@ class TrackResult:
     pixel_size: Tuple[int, int]     # 추적에 쓴 프레임 크기 (width, height)
 
 
-def track_video(path: str, fps: float, max_height: int, complexity: int, upper_body: bool, smooth: float) -> TrackResult:
-    """1패스: 고정 fps로 디코딩해 전체 프레임을 추적하고 FrameData 시퀀스를 만든다."""
+def track_video(
+    path: str,
+    fps: float,
+    max_height: int,
+    complexity: int,
+    upper_body: bool,
+    smooth: float,
+    face_model: Optional[str] = DEFAULT_FACE_MODEL_PATH,
+) -> TrackResult:
+    """1패스: 고정 fps로 디코딩해 전체 프레임을 추적하고 FrameData 시퀀스를 만든다.
+
+    몸·손은 Holistic(추적용 축소 프레임), 얼굴은 Face Landmarker(원본 해상도)로 추적한다.
+    face_model이 None이거나 쓸 수 없으면 Holistic 얼굴 좌표만 쓴다 (블렌드셰이프 없음).
+    """
     probe = video_io.probe_video(path)
+    face_tracker = create_face_tracker(face_model)
     retargeter = _Retargeter(upper_body=upper_body, smooth=smooth)
     frames: List[retarget.FrameData] = []
     raws = []
     pixel_size = (probe.width, probe.height)
     expected = int(round(probe.duration * fps)) if probe.duration > 0 else 0
-    with HolisticTracker(model_complexity=complexity) as tracker:
-        for frame_bgr in video_io.read_frames_cfr(path, fps, probe):
-            small = video_io.resize_to_max_height(frame_bgr, max_height)
-            pixel_size = (small.shape[1], small.shape[0])
-            raw, _ = tracker.process(small)
-            raws.append(raw)
-            frames.append(retargeter.step(raw))
-            _print_progress("추적", len(frames), expected)
+    try:
+        with HolisticTracker(model_complexity=complexity) as tracker:
+            for frame_bgr in video_io.read_frames_cfr(path, fps, probe):
+                small = video_io.resize_to_max_height(frame_bgr, max_height)
+                pixel_size = (small.shape[1], small.shape[0])
+                raw, _ = tracker.process(small)
+                if face_tracker is not None:
+                    timestamp_ms = int(round(len(frames) * 1000.0 / fps))
+                    face_points, blendshapes = face_tracker.process(frame_bgr, timestamp_ms, pixel_size)
+                    if face_points is not None:
+                        raw.face_pixel = face_points
+                        raw.face_blendshapes = blendshapes
+                raws.append(raw)
+                frames.append(retargeter.step(raw))
+                _print_progress("추적", len(frames), expected)
+    finally:
+        if face_tracker is not None:
+            face_tracker.close()
     sys.stdout.write("\n")
     return TrackResult(probe=probe, fps=fps, frames=frames, raws=raws, pixel_size=pixel_size)
 
@@ -289,7 +340,10 @@ def run(args: argparse.Namespace) -> int:
     )
 
     # -- 1패스: 추적 ------------------------------------------------------------
-    track = track_video(args.input, args.fps, args.max_height, args.complexity, args.upper_body, args.smooth)
+    face_model = None if args.no_blendshapes else args.face_model
+    track = track_video(
+        args.input, args.fps, args.max_height, args.complexity, args.upper_body, args.smooth, face_model
+    )
     n_frames = len(track.frames)
     print(
         f"입력: {args.input} ({track.probe.width}x{track.probe.height}, {track.probe.fps:.2f}fps "

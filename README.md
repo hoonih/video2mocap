@@ -8,6 +8,8 @@
 
 **ffmpeg가 필요합니다** (`brew install ffmpeg` / `sudo apt install ffmpeg`). 입력 디코딩에 씁니다.
 
+얼굴 블렌드셰이프용 모델은 따로 받아야 합니다: `assets/models/README.md` 참고.
+
 
 Python 3.9~3.12 환경을 권장합니다.
 
@@ -44,7 +46,9 @@ python -m mocap input.mp4
 | `--shoulder-ratio 비율` | 정면 어깨너비가 화면 폭에서 차지할 비율 | `0.35` |
 | `--anchor-y 비율` | 어깨 중앙의 세로 위치 (0=위, 1=아래) | `0.42` |
 | `--show-legs` | 상체 모드에서도 합성 다리를 그림 | 꺼짐(다리 숨김) |
-| `--face-scale 배율` | 머리·얼굴 확대 배율 (표정 판독용) | `1.4` |
+| `--face-scale 배율` | 머리·얼굴 확대 배율 | `1.0` |
+| `--face-model 경로` | Face Landmarker 모델(블렌드셰이프). 없으면 Holistic 얼굴 좌표로 대신 | `assets/models/face_landmarker.task` |
+| `--no-blendshapes` | Face Landmarker를 끄고 Holistic 얼굴 좌표만 사용 | 꺼짐 |
 | `--export-json 경로.json` | 프레임별 3D 관절 좌표를 JSON으로 저장 | 없음 |
 
 ### 예시

@@ -22,3 +22,9 @@ venv/
 
 # Exported data
 *_mocap.json
+
+# 모델 파일 (출처·라이선스는 각 폴더의 README.md)
+assets/models/*.task
+assets/avatar/*.vrm
+assets/avatar/*.glb
+assets/avatar/*.gltf

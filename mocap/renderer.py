@@ -35,9 +35,9 @@ LIMB_THICKNESS = {
     "neck": 16,
 }
 HEAD_RADIUS_METERS = 0.11
-# 머리와 얼굴 요소를 머리 중심 기준으로 확대하는 배율. 표정 움직임의 '비율'은 원본과 같게 두고
-# 화면상 픽셀 변화량만 키운다 (docs/stimulus-spec.md 참고). 손이 닿는 얼굴 위치는 그만큼 어긋난다.
-DEFAULT_FACE_SCALE = 1.4
+# 머리와 얼굴 요소를 머리 중심 기준으로 확대하는 배율. 1.0이 기본이다: 확대는 조건 A와의 교란 요인이고,
+# 블렌드셰이프(Phase 4B)로 표정을 직접 받으므로 확대로 눈썹 변화를 키울 이유가 없다.
+DEFAULT_FACE_SCALE = 1.0
 FACE_COLOR = (30, 30, 30)
 # 얼굴 요소 굵기 = 머리 반지름(px) × 비율
 BROW_THICKNESS_RATIO = 0.07

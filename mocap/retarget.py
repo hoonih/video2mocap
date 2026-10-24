@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 
@@ -25,6 +25,8 @@ class FrameData:
     # 출력 화면에서 어깨 중앙이 놓일 픽셀 위치. 조건 A(원본)에서 화자가 움직인 만큼 B·C도 옮긴다.
     # None이면 카메라 기본 배치를 그대로 쓴다.
     screen_anchor: Optional[np.ndarray] = None
+    # ARKit 호환 블렌드셰이프 계수 (이름 → 0~1). 실측값을 증폭하지 않는다. 폴백 경로에서는 None.
+    face_blendshapes: Optional[Dict[str, float]] = None
 
 
 def assign_hands(
