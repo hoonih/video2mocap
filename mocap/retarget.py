@@ -21,7 +21,7 @@ class FrameData:
     pose: np.ndarray                      # (33, 3) meters
     left_hand: Optional[np.ndarray] = None   # (21, 3) meters
     right_hand: Optional[np.ndarray] = None  # (21, 3) meters
-    face: Optional[np.ndarray] = None        # (7, 3) meters, landmarks.FACE_KEY_ORDER 순서
+    face: Optional[np.ndarray] = None        # (N, 3) meters, landmarks.FACE_KEY_ORDER 순서
 
 
 def assign_hands(
@@ -92,19 +92,97 @@ def hand_to_world(
     return wrist_world + relative * scale
 
 
-def face_to_world(
-    face_pixel: Optional[np.ndarray], nose_world: np.ndarray, scale: Optional[float]
-) -> Optional[np.ndarray]:
-    """얼굴 핵심 포인트(눈/코/입)만 추출해 코 끝 기준으로 nose_world 위치에 붙인다."""
-    if face_pixel is None or scale is None:
+def head_center(pose_world: np.ndarray) -> np.ndarray:
+    """머리 중심(월드 좌표)을 양쪽 귀의 중점으로 잡는다. 코보다 약 10cm 뒤에 있다."""
+    return (pose_world[landmarks.LEFT_EAR] + pose_world[landmarks.RIGHT_EAR]) / 2.0
+
+
+def face_offsets(face_pixel: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """얼굴 핵심 포인트를 머리 중심 기준 상대 좌표(미터, landmarks.FACE_KEY_ORDER 순서)로 바꾼다.
+
+    머리 중심은 얼굴 양쪽 가장자리의 3D 중점이다. 코끝을 기준으로 삼으면 코끝이 항상 가장
+    앞에 있어서 머리가 돌아가도 얼굴 요소가 머리 구 위에서 움직이지 않는다.
+    크기는 3D 눈꼬리 거리를 FACE_EYE_SPAN_METERS에 맞춘다. 고개를 돌려도 거의 변하지 않는다.
+    """
+    if face_pixel is None:
         return None
-    nose_px = face_pixel[landmarks.FACE_KEY_INDICES["nose_tip"]]
-    points = []
-    for name in landmarks.FACE_KEY_ORDER:
-        idx = landmarks.FACE_KEY_INDICES[name]
-        relative = face_pixel[idx] - nose_px
-        points.append(nose_world + relative * scale)
-    return np.stack(points, axis=0)
+    eye_span_px = np.linalg.norm(
+        face_pixel[landmarks.FACE_KEY_INDICES["left_eye"]]
+        - face_pixel[landmarks.FACE_KEY_INDICES["right_eye"]]
+    )
+    if eye_span_px < 1e-6:
+        return None
+    scale = landmarks.FACE_EYE_SPAN_METERS / eye_span_px
+    center_px = np.mean(
+        [face_pixel[landmarks.FACE_KEY_INDICES[k]] for k in landmarks.FACE_CENTER_KEYS], axis=0
+    )
+    idxs = [landmarks.FACE_KEY_INDICES[name] for name in landmarks.FACE_KEY_ORDER]
+    return (face_pixel[idxs] - center_px) * scale
+
+
+def face_to_world(face_pixel: Optional[np.ndarray], head_center_world: np.ndarray) -> Optional[np.ndarray]:
+    """얼굴 핵심 포인트를 머리 중심(head_center_world)에 붙인 월드 좌표로 바꾼다."""
+    offsets = face_offsets(face_pixel)
+    if offsets is None:
+        return None
+    return head_center_world + offsets
+
+
+def _head_frame(x_axis: np.ndarray, forward: np.ndarray) -> Optional[np.ndarray]:
+    """x축(화자 오른쪽→왼쪽)과 얼굴 정면 방향(카메라 쪽)으로 머리 회전 행렬을 만든다.
+
+    열벡터는 (x=화자 왼쪽, y=아래, z=뒤통수 방향). 정면을 보는 자세에서 단위행렬이 된다.
+    """
+    x_norm = np.linalg.norm(x_axis)
+    if x_norm < 1e-9:
+        return None
+    x = x_axis / x_norm
+    z = -forward - np.dot(-forward, x) * x
+    z_norm = np.linalg.norm(z)
+    if z_norm < 1e-9:
+        return None
+    z = z / z_norm
+    y = np.cross(z, x)
+    return np.stack([x, y, z], axis=1)
+
+
+def head_rotation_from_face(face: np.ndarray) -> Optional[np.ndarray]:
+    """얼굴 포인트(face_offsets 또는 face_to_world 출력)로 머리 회전 행렬을 추정한다."""
+    k = landmarks.FACE_KEY_ORDER.index
+    x_axis = face[k("left_eye")] - face[k("right_eye")]
+    down = face[k("chin")] - face[k("forehead")]
+    return _head_frame(x_axis, np.cross(down, x_axis))
+
+
+def head_rotation_from_pose(pose_world: np.ndarray) -> Optional[np.ndarray]:
+    """얼굴이 검출되지 않을 때 쓰는 대체 추정: 양쪽 눈을 잇는 벡터 + 머리 중심→코 벡터.
+
+    코가 귀보다 약간 아래에 있어서 정면 자세에서도 pitch가 0이 아니다. 절대 각도가 아니라
+    프레임 간 회전 변화량(carry_face_offsets)을 구하는 데만 쓴다.
+    """
+    x_axis = pose_world[landmarks.LEFT_EYE] - pose_world[landmarks.RIGHT_EYE]
+    forward = pose_world[landmarks.NOSE] - head_center(pose_world)
+    return _head_frame(x_axis, forward)
+
+
+def head_angles(rotation: np.ndarray) -> Tuple[float, float, float]:
+    """회전 행렬을 (yaw, pitch, roll) 도 단위로 바꾼다.
+
+    yaw +: 화면 오른쪽을 봄, pitch +: 아래를 봄(끄덕임), roll +: 화면 기준 시계 방향 기울임.
+    """
+    forward = -rotation[:, 2]
+    yaw = math.degrees(math.atan2(forward[0], -forward[2]))
+    pitch = math.degrees(math.atan2(forward[1], math.hypot(forward[0], forward[2])))
+    roll = math.degrees(math.atan2(rotation[1, 0], rotation[0, 0]))
+    return yaw, pitch, roll
+
+
+def carry_face_offsets(
+    offsets: np.ndarray, rotation_then: np.ndarray, rotation_now: np.ndarray
+) -> np.ndarray:
+    """마지막으로 검출된 얼굴을 그 뒤의 머리 회전만큼 돌린다 (손이 얼굴을 가린 구간용)."""
+    delta = rotation_now @ rotation_then.T
+    return offsets @ delta.T
 
 
 def synthesize_lower_body(pose_world: np.ndarray) -> np.ndarray:

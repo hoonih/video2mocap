@@ -3,8 +3,10 @@ import os
 import numpy as np
 
 from mocap import landmarks
-from mocap.renderer import CapsuleRenderer
-from mocap.retarget import FrameData
+from mocap.renderer import FACE_COLOR, CapsuleRenderer
+from mocap.retarget import FrameData, face_to_world, head_center
+
+from .face_fixture import canonical_face_pixel
 
 SCRATCH_DIR = os.environ.get(
     "MOCAP_TEST_SCRATCH",
@@ -36,19 +38,9 @@ def _fake_hand(wrist_world: np.ndarray, spread: float = 0.03) -> np.ndarray:
     return hand
 
 
-def _fake_face(nose_world: np.ndarray) -> np.ndarray:
-    # landmarks.FACE_KEY_ORDER 순서: nose_tip, left_eye, right_eye, mouth_left, mouth_right, mouth_top, mouth_bottom
-    offsets = {
-        "nose_tip": (0.0, 0.0, -0.03),
-        "left_eye": (-0.03, -0.02, -0.03),
-        "right_eye": (0.03, -0.02, -0.03),
-        "mouth_left": (-0.02, 0.03, -0.03),
-        "mouth_right": (0.02, 0.03, -0.03),
-        "mouth_top": (0.0, 0.025, -0.03),
-        "mouth_bottom": (0.0, 0.035, -0.03),
-    }
-    pts = [nose_world + np.array(offsets[name]) for name in landmarks.FACE_KEY_ORDER]
-    return np.stack(pts, axis=0)
+def _real_face(pose: np.ndarray, **expression) -> np.ndarray:
+    """표준 얼굴 모델을 FaceMesh 픽셀 형식으로 만든 뒤 실제 face_to_world를 거친 얼굴."""
+    return face_to_world(canonical_face_pixel(**expression), head_center(pose))
 
 
 def test_full_body_render_produces_nonblank_image():
@@ -72,7 +64,7 @@ def test_upper_body_with_hands_and_face_render():
     pose = _full_body_pose()
     left_hand = _fake_hand(pose[landmarks.LEFT_WRIST])
     right_hand = _fake_hand(pose[landmarks.RIGHT_WRIST])
-    face = _fake_face(pose[landmarks.NOSE])
+    face = _real_face(pose)
 
     frame = FrameData(pose=pose, left_hand=left_hand, right_hand=right_hand, face=face)
     renderer = CapsuleRenderer(width=480, height=640, upper_body=True, yaw_deg=0.0)
@@ -106,3 +98,82 @@ def test_render_without_hands_or_face_does_not_crash():
 
     img = renderer.render(frame)
     assert img.shape == (200, 200, 3)
+
+
+# --- 얼굴 표현 (Phase 1) ---------------------------------------------------------
+
+def _render_face(**expression):
+    pose = landmarks.build_neutral_pose()
+    renderer = CapsuleRenderer(width=720, height=1280, upper_body=True)
+    face = _real_face(pose, **expression)
+    img = renderer.render(FrameData(pose=pose, face=face))
+    center = head_center(pose)
+    drawn = center + (face - center) * renderer.face_scale
+    proj = renderer._project(renderer._camera_transform(drawn))
+    return img, {name: proj[i] for i, name in enumerate(landmarks.FACE_KEY_ORDER)}
+
+
+def _is_face_color(img, pt) -> bool:
+    x, y = int(round(pt[0])), int(round(pt[1]))
+    return tuple(int(v) for v in img[y, x]) == FACE_COLOR
+
+
+def _face_pixels(img):
+    ys, xs = np.nonzero(np.all(img == np.array(FACE_COLOR, dtype=np.uint8), axis=2))
+    return xs, ys
+
+
+def test_frontal_face_draws_nose_eyes_brows_and_mouth():
+    """회귀: 코끝 기준 컬링 때문에 얼굴이 하나도 그려지지 않던 버그 (renderer.py 구 338행)."""
+    img, pts = _render_face(mouth_open_cm=1.0)
+
+    assert _is_face_color(img, pts["nose_tip"])
+    for outline in (landmarks.LEFT_EYE_OUTLINE, landmarks.RIGHT_EYE_OUTLINE, landmarks.MOUTH_OUTLINE):
+        assert _is_face_color(img, np.mean([pts[n] for n in outline], axis=0)), outline
+    for brow in (landmarks.LEFT_BROW_KEYS, landmarks.RIGHT_BROW_KEYS):
+        assert _is_face_color(img, pts[brow[2]]), brow
+
+
+def test_brow_raise_and_lower_move_brow_pixels():
+    raised, pts = _render_face(brow_raise_cm=0.8)
+    lowered, _ = _render_face(brow_raise_cm=-0.5)
+    eye_y = pts["left_eye"][1]
+
+    def brow_mean_y(img):
+        xs, ys = _face_pixels(img)
+        return ys[ys < eye_y - 8].mean()
+
+    assert brow_mean_y(lowered) - brow_mean_y(raised) > 6.0
+
+
+def test_mouth_open_enlarges_mouth_shape():
+    closed, pts = _render_face()
+    opened, _ = _render_face(mouth_open_cm=1.5)
+    nose_y = pts["nose_tip"][1]
+
+    def mouth_area(img):
+        _, ys = _face_pixels(img)
+        return int(np.sum(ys > nose_y + 10))
+
+    assert mouth_area(opened) > mouth_area(closed) * 2
+
+
+def test_head_yaw_moves_face_across_head():
+    _, frontal = _render_face()
+    turned_img, turned = _render_face(yaw_deg=35)
+    assert turned["nose_tip"][0] - frontal["nose_tip"][0] > 20  # 코가 화면 오른쪽으로 이동
+    assert _is_face_color(turned_img, turned["nose_tip"])
+
+
+def test_head_shake_hides_far_side_features():
+    img, pts = _render_face(yaw_deg=80)
+    # 화면 오른쪽으로 고개를 돌리면 화자의 왼쪽 눈이 뒤로 넘어가 보이지 않는다
+    assert not _is_face_color(img, np.mean([pts[n] for n in landmarks.LEFT_EYE_OUTLINE], axis=0))
+
+
+def test_face_scale_enlarges_head_and_face_together():
+    pose = landmarks.build_neutral_pose()
+    face = _real_face(pose, mouth_open_cm=1.0)
+    small = CapsuleRenderer(width=720, height=1280, upper_body=True, face_scale=1.0).render(FrameData(pose=pose, face=face))
+    large = CapsuleRenderer(width=720, height=1280, upper_body=True, face_scale=1.4).render(FrameData(pose=pose, face=face))
+    assert len(_face_pixels(large)[0]) > len(_face_pixels(small)[0]) * 1.6  # 면적은 대략 배율의 제곱

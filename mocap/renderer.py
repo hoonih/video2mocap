@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from . import landmarks
-from .retarget import FrameData
+from .retarget import FrameData, head_center
 
 # ---------------------------------------------------------------------------
 # 카메라/투영 상수
@@ -35,6 +35,15 @@ LIMB_THICKNESS = {
     "neck": 16,
 }
 HEAD_RADIUS_METERS = 0.11
+# 머리와 얼굴 요소를 머리 중심 기준으로 확대하는 배율. 표정 움직임의 '비율'은 원본과 같게 두고
+# 화면상 픽셀 변화량만 키운다 (docs/stimulus-spec.md 참고). 손이 닿는 얼굴 위치는 그만큼 어긋난다.
+DEFAULT_FACE_SCALE = 1.4
+FACE_COLOR = (30, 30, 30)
+# 얼굴 요소 굵기 = 머리 반지름(px) × 비율
+BROW_THICKNESS_RATIO = 0.07
+FACE_OUTLINE_RATIO = 0.03
+NOSE_RADIUS_RATIO = 0.04
+FACE_DEPTH_EPSILON = 1e-3  # 얼굴 요소를 머리 구 바로 위에 그리기 위한 깊이 보정치
 HAND_JOINT_RADIUS = 3
 FINGER_THICKNESS = 3
 
@@ -97,6 +106,7 @@ class CapsuleRenderer:
         upper_body: bool = False,
         yaw_deg: float = 0.0,
         orbit_deg_per_frame: float = 0.0,
+        face_scale: float = DEFAULT_FACE_SCALE,
     ) -> None:
         self.width = width
         self.height = height
@@ -104,6 +114,7 @@ class CapsuleRenderer:
         self.yaw_rad = math.radians(yaw_deg)
         self.orbit_rad_per_frame = math.radians(orbit_deg_per_frame)
         self._orbit_accum = 0.0
+        self.face_scale = face_scale
 
         self.camera_distance = UPPER_BODY_CAMERA_DISTANCE if upper_body else FULL_BODY_CAMERA_DISTANCE
         self.camera_height = UPPER_BODY_CAMERA_HEIGHT if upper_body else FULL_BODY_CAMERA_HEIGHT
@@ -142,10 +153,15 @@ class CapsuleRenderer:
         primitives: List[_Primitive] = []
         primitives.extend(self._limb_primitives(frame.pose, cam_pose, proj_pose))
         primitives.extend(self._torso_primitives(frame.pose, cam_pose, proj_pose))
-        primitives.extend(self._neck_primitive(cam_pose, proj_pose))
+        head_world = head_center(frame.pose)
+        head_cam = self._camera_transform(head_world[np.newaxis, :])[0]
+        head_px = self._project(head_cam[np.newaxis, :])[0]
+        head_radius_px = max(
+            4, int(self.focal_length * HEAD_RADIUS_METERS * self.face_scale / max(head_cam[2], 0.05))
+        )
 
-        head_depth = cam_pose[landmarks.NOSE, 2]
-        primitives.append(self._head_primitive(cam_pose, proj_pose, head_depth))
+        primitives.extend(self._neck_primitive(cam_pose, proj_pose, head_px))
+        primitives.append(self._head_primitive(head_cam, head_px, head_radius_px))
 
         if frame.left_hand is not None:
             primitives.extend(self._hand_primitives(frame.left_hand, "left"))
@@ -153,7 +169,8 @@ class CapsuleRenderer:
             primitives.extend(self._hand_primitives(frame.right_hand, "right"))
 
         if frame.face is not None:
-            primitives.extend(self._face_primitives(frame.face, head_depth))
+            face_world = head_world + (frame.face - head_world) * self.face_scale
+            primitives.extend(self._face_primitives(face_world, head_cam, head_radius_px))
 
         primitives.sort(key=lambda p: p.depth, reverse=True)  # 먼 것부터 그려서 가까운 게 덮도록
         for prim in primitives:
@@ -269,14 +286,16 @@ class CapsuleRenderer:
 
     # -- 목 (항상 머리 뒤) ------------------------------------------------------
 
-    def _neck_primitive(self, cam_pose: np.ndarray, proj_pose: np.ndarray) -> List[_Primitive]:
+    def _neck_primitive(
+        self, cam_pose: np.ndarray, proj_pose: np.ndarray, head_px: np.ndarray
+    ) -> List[_Primitive]:
         shoulder_mid_idx = (landmarks.LEFT_SHOULDER, landmarks.RIGHT_SHOULDER)
         p1 = tuple(
             (
                 (proj_pose[shoulder_mid_idx[0]] + proj_pose[shoulder_mid_idx[1]]) / 2.0
             ).astype(int)
         )
-        p2 = tuple(proj_pose[landmarks.NOSE].astype(int))
+        p2 = tuple(head_px.astype(int))
         depth = float((cam_pose[shoulder_mid_idx[0], 2] + cam_pose[shoulder_mid_idx[1], 2]) / 2.0)
         depth += NECK_DEPTH_BIAS  # 항상 머리보다 뒤에 그리기 위한 강제 바이어스
         color = BASE_COLOR.copy()
@@ -289,22 +308,18 @@ class CapsuleRenderer:
     # -- 머리 (구) -------------------------------------------------------------
 
     def _head_primitive(
-        self, cam_pose: np.ndarray, proj_pose: np.ndarray, head_depth: float
+        self, head_cam: np.ndarray, head_px: np.ndarray, radius_px: int
     ) -> _Primitive:
-        center = tuple(proj_pose[landmarks.NOSE].astype(int))
-        z = max(cam_pose[landmarks.NOSE, 2], 0.05)
-        radius_px = max(4, int(self.focal_length * HEAD_RADIUS_METERS / z))
+        center = tuple(head_px.astype(int))
         base_color = _clamp_color(BASE_COLOR * 1.1)
         outline_color = _clamp_color(BASE_COLOR * OUTLINE_DARKEN)
-        highlight_color = _clamp_color(BASE_COLOR * HIGHLIGHT_BRIGHTEN)
 
+        # 하이라이트는 그리지 않는다. 얼굴 요소와 겹치면 눈처럼 보여 표정 판독을 방해한다.
         def draw(img, center=center, radius_px=radius_px):
             cv2.circle(img, center, radius_px, outline_color, -1, cv2.LINE_AA)
             cv2.circle(img, center, max(1, int(radius_px * 0.9)), base_color, -1, cv2.LINE_AA)
-            highlight_center = (center[0] - radius_px // 3, center[1] - radius_px // 3)
-            cv2.circle(img, highlight_center, max(1, radius_px // 3), highlight_color, -1, cv2.LINE_AA)
 
-        return _Primitive(depth=head_depth, draw_fn=draw)
+        return _Primitive(depth=float(head_cam[2]), draw_fn=draw)
 
     # -- 손 (손가락 체인) --------------------------------------------------------
 
@@ -328,41 +343,43 @@ class CapsuleRenderer:
 
         return [_Primitive(depth=depth, draw_fn=draw)]
 
-    # -- 얼굴 (눈/코/입) ---------------------------------------------------------
+    # -- 얼굴 (눈썹/눈/코/입) ----------------------------------------------------
 
-    def _face_primitives(self, face_world: np.ndarray, head_depth: float) -> List[_Primitive]:
+    def _face_primitives(
+        self, face_world: np.ndarray, head_cam: np.ndarray, head_radius_px: int
+    ) -> List[_Primitive]:
         cam = self._camera_transform(face_world)
         proj = self._project(cam)
 
-        # 머리 구보다 카메라에 더 가까울 때만(= depth가 더 작을 때만) 보이게 한다.
-        visible_mask = cam[:, 2] < head_depth
-        if not np.any(visible_mask):
+        # 머리 중심보다 카메라 쪽(앞 반구)에 있는 점만 보인다. 고개를 돌리면 먼 쪽 눈썹/눈이 사라진다.
+        visible = cam[:, 2] < head_cam[2]
+        if not np.any(visible):
             return []
 
-        depth = float(np.min(cam[:, 2]))
-        color = (30, 30, 30)
+        k = landmarks.FACE_KEY_ORDER.index
+        pts = {name: proj[k(name)].astype(np.int32) for name in landmarks.FACE_KEY_ORDER}
+        vis = {name: bool(visible[k(name)]) for name in landmarks.FACE_KEY_ORDER}
 
-        nose_idx = landmarks.FACE_KEY_ORDER.index("nose_tip")
-        left_eye_idx = landmarks.FACE_KEY_ORDER.index("left_eye")
-        right_eye_idx = landmarks.FACE_KEY_ORDER.index("right_eye")
-        mouth_left_idx = landmarks.FACE_KEY_ORDER.index("mouth_left")
-        mouth_right_idx = landmarks.FACE_KEY_ORDER.index("mouth_right")
+        brow_thickness = max(2, int(round(head_radius_px * BROW_THICKNESS_RATIO)))
+        outline_thickness = max(1, int(round(head_radius_px * FACE_OUTLINE_RATIO)))
+        nose_radius = max(2, int(round(head_radius_px * NOSE_RADIUS_RATIO)))
 
-        def draw(img, proj=proj, visible_mask=visible_mask, color=color):
-            if visible_mask[left_eye_idx]:
-                cv2.circle(img, tuple(proj[left_eye_idx].astype(int)), 3, color, -1, cv2.LINE_AA)
-            if visible_mask[right_eye_idx]:
-                cv2.circle(img, tuple(proj[right_eye_idx].astype(int)), 3, color, -1, cv2.LINE_AA)
-            if visible_mask[nose_idx]:
-                cv2.circle(img, tuple(proj[nose_idx].astype(int)), 2, color, -1, cv2.LINE_AA)
-            if visible_mask[mouth_left_idx] and visible_mask[mouth_right_idx]:
-                cv2.line(
-                    img,
-                    tuple(proj[mouth_left_idx].astype(int)),
-                    tuple(proj[mouth_right_idx].astype(int)),
-                    color,
-                    2,
-                    cv2.LINE_AA,
-                )
+        def polygon(names):
+            if not all(vis[n] for n in names):
+                return None
+            return np.array([pts[n] for n in names], dtype=np.int32)
 
-        return [_Primitive(depth=depth, draw_fn=draw)]
+        def draw(img):
+            for brow in (landmarks.LEFT_BROW_KEYS, landmarks.RIGHT_BROW_KEYS):
+                line = polygon(brow)
+                if line is not None:
+                    cv2.polylines(img, [line], False, FACE_COLOR, brow_thickness, cv2.LINE_AA)
+            for outline in (landmarks.LEFT_EYE_OUTLINE, landmarks.RIGHT_EYE_OUTLINE, landmarks.MOUTH_OUTLINE):
+                poly = polygon(outline)
+                if poly is not None:
+                    cv2.fillPoly(img, [poly], FACE_COLOR, cv2.LINE_AA)
+                    cv2.polylines(img, [poly], True, FACE_COLOR, outline_thickness, cv2.LINE_AA)
+            if vis["nose_tip"]:
+                cv2.circle(img, tuple(int(v) for v in pts["nose_tip"]), nose_radius, FACE_COLOR, -1, cv2.LINE_AA)
+
+        return [_Primitive(depth=float(head_cam[2]) - FACE_DEPTH_EPSILON, draw_fn=draw)]

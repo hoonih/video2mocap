@@ -1,17 +1,26 @@
 import math
 
 import numpy as np
+import pytest
 
 from mocap import landmarks
 from mocap.retarget import (
     FrameData,
     assign_hands,
+    carry_face_offsets,
     compute_scale,
+    face_offsets,
     face_to_world,
     hand_to_world,
+    head_angles,
+    head_center,
+    head_rotation_from_face,
+    head_rotation_from_pose,
     hold_missing,
     synthesize_lower_body,
 )
+
+from .face_fixture import canonical_face_pixel
 
 
 def _pose_pixel_with_wrists(left_xy, right_xy):
@@ -113,23 +122,65 @@ def test_hand_to_world_none_when_missing_input():
     assert hand_to_world(np.zeros((21, 3)), np.zeros(3), None) is None
 
 
-def test_face_to_world_anchors_nose_and_orders_points():
-    face_pixel = np.zeros((478, 3))
-    nose_idx = landmarks.FACE_KEY_INDICES["nose_tip"]
-    left_eye_idx = landmarks.FACE_KEY_INDICES["left_eye"]
-    face_pixel[nose_idx] = (100, 100, 0)
-    face_pixel[left_eye_idx] = (120, 90, 0)  # 코 기준 x+20, y-10
+def test_face_to_world_anchors_head_center_and_normalizes_size():
+    face_pixel = canonical_face_pixel(px_per_cm=7.0)
+    center = np.array([0.1, -0.6, 0.2])
 
-    nose_world = np.array([0.0, 0.0, 0.0])
-    scale = 0.005
+    world = face_to_world(face_pixel, center)
 
-    world = face_to_world(face_pixel, nose_world, scale)
+    k = landmarks.FACE_KEY_ORDER.index
+    assert world.shape == (len(landmarks.FACE_KEY_ORDER), 3)
+    edge_mid = (world[k("face_left_edge")] + world[k("face_right_edge")]) / 2.0
+    assert np.allclose(edge_mid, center)
+    eye_span = np.linalg.norm(world[k("left_eye")] - world[k("right_eye")])
+    assert eye_span == pytest.approx(landmarks.FACE_EYE_SPAN_METERS)
+    # 코끝은 머리 중심보다 카메라 쪽(z 작음)에 있다
+    assert world[k("nose_tip"), 2] < center[2] - 0.05
 
-    assert world.shape == (landmarks.NUM_FACE_KEY_POINTS, 3)
-    nose_out_idx = landmarks.FACE_KEY_ORDER.index("nose_tip")
-    eye_out_idx = landmarks.FACE_KEY_ORDER.index("left_eye")
-    assert np.allclose(world[nose_out_idx], nose_world)
-    assert np.allclose(world[eye_out_idx], np.array([0.1, -0.05, 0.0]))
+
+def test_face_size_does_not_depend_on_image_scale():
+    small = face_offsets(canonical_face_pixel(px_per_cm=3.0))
+    large = face_offsets(canonical_face_pixel(px_per_cm=12.0))
+    assert np.allclose(small, large)
+
+
+def test_face_to_world_none_when_missing():
+    assert face_to_world(None, np.zeros(3)) is None
+
+
+@pytest.mark.parametrize(
+    "yaw, pitch, roll", [(0, 0, 0), (30, 0, 0), (-30, 0, 0), (0, 20, 0), (0, -15, 0), (0, 0, 15), (20, -10, 5)]
+)
+def test_head_rotation_from_face_recovers_angles(yaw, pitch, roll):
+    offsets = face_offsets(canonical_face_pixel(yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll))
+    est = head_angles(head_rotation_from_face(offsets))
+    # 이마-턱 선이 완전히 수직이 아니라 pitch에 1도 미만의 고정 편향이 있다
+    assert est == pytest.approx((yaw, pitch, roll), abs=1.5)
+
+
+def test_carry_face_offsets_follows_head_rotation():
+    frontal = face_offsets(canonical_face_pixel())
+    turned = face_offsets(canonical_face_pixel(yaw_deg=25))
+    rot_then = head_rotation_from_face(frontal)
+    rot_now = head_rotation_from_face(turned)
+
+    carried = carry_face_offsets(frontal, rot_then, rot_now)
+
+    assert np.allclose(carried, turned, atol=2e-3)
+
+
+def test_head_center_is_ear_midpoint():
+    pose = np.zeros((landmarks.NUM_POSE_LANDMARKS, 3))
+    pose[landmarks.LEFT_EAR] = (0.08, -0.6, 0.1)
+    pose[landmarks.RIGHT_EAR] = (-0.06, -0.62, 0.12)
+    assert np.allclose(head_center(pose), (0.01, -0.61, 0.11))
+
+
+def test_head_rotation_from_pose_is_identity_for_neutral_pose():
+    rot = head_rotation_from_pose(landmarks.build_neutral_pose())
+    yaw, _, roll = head_angles(rot)
+    assert yaw == pytest.approx(0.0, abs=1e-6)
+    assert roll == pytest.approx(0.0, abs=1e-6)
 
 
 # --- synthesize_lower_body ---------------------------------------------------

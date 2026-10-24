@@ -13,6 +13,8 @@ import numpy as np
 NOSE = 0
 LEFT_EYE = 2
 RIGHT_EYE = 5
+LEFT_EAR = 7
+RIGHT_EAR = 8
 LEFT_SHOULDER = 11
 RIGHT_SHOULDER = 12
 LEFT_ELBOW = 13
@@ -77,20 +79,49 @@ HAND_FINGERS = (
 # ---------------------------------------------------------------------------
 # Face 랜드마크 (mediapipe face mesh 468점 중 필요한 핵심 포인트만 추출)
 # ---------------------------------------------------------------------------
+# 좌우는 MediaPipe 명명 규칙(화자 기준)을 따른다. 화자의 왼쪽 = 화면 오른쪽.
+# 눈썹은 안쪽 끝이 아니라 바깥 끝(관자놀이 쪽)부터 미간 쪽 순서로 나열한다.
+LEFT_BROW_INDICES = (300, 293, 334, 296, 336)
+RIGHT_BROW_INDICES = (70, 63, 105, 66, 107)
+LEFT_BROW_KEYS = tuple(f"left_brow_{i}" for i in range(len(LEFT_BROW_INDICES)))
+RIGHT_BROW_KEYS = tuple(f"right_brow_{i}" for i in range(len(RIGHT_BROW_INDICES)))
+
 FACE_KEY_INDICES = {
     "nose_tip": 1,
-    "left_eye": 263,
-    "right_eye": 33,
-    "mouth_left": 61,
-    "mouth_right": 291,
-    "mouth_top": 13,
-    "mouth_bottom": 14,
+    "left_eye": 263,          # 바깥 눈꼬리
+    "left_eye_inner": 362,
+    "left_eye_top": 386,
+    "left_eye_bottom": 374,
+    "right_eye": 33,          # 바깥 눈꼬리
+    "right_eye_inner": 133,
+    "right_eye_top": 159,
+    "right_eye_bottom": 145,
+    "mouth_left": 291,
+    "mouth_right": 61,
+    "mouth_top": 13,          # 윗입술 안쪽
+    "mouth_bottom": 14,       # 아랫입술 안쪽
+    "forehead": 10,
+    "chin": 152,
+    "face_left_edge": 454,
+    "face_right_edge": 234,
+    **dict(zip(LEFT_BROW_KEYS, LEFT_BROW_INDICES)),
+    **dict(zip(RIGHT_BROW_KEYS, RIGHT_BROW_INDICES)),
 }
 # FrameData.face 배열에서의 순서 (face_to_world의 출력 순서와 일치해야 함)
-FACE_KEY_ORDER = (
-    "nose_tip", "left_eye", "right_eye",
-    "mouth_left", "mouth_right", "mouth_top", "mouth_bottom",
-)
+FACE_KEY_ORDER = tuple(FACE_KEY_INDICES)
+
+# 얼굴 메시에서 머리 중심으로 쓰는 점: 양쪽 얼굴 가장자리(귀 앞)의 3D 중점.
+# FaceMesh의 z 원점은 얼굴 앞면 근처라서 코끝 z는 이 중점보다 약 10cm 앞에 있다.
+FACE_CENTER_KEYS = ("face_left_edge", "face_right_edge")
+
+# 양쪽 바깥 눈꼬리(263-33) 사이 3D 거리(미터). MediaPipe canonical face model 기준값.
+# 얼굴 크기를 어깨너비 대신 이 값으로 맞춘다. 어깨 기반 환산은 몸을 틀면 얼굴이 최대 50% 커진다.
+FACE_EYE_SPAN_METERS = 0.0889
+
+# 눈 윤곽 폴리곤(바깥 꼬리 → 위 → 안쪽 꼬리 → 아래), 입 폴리곤(오른쪽 → 위 → 왼쪽 → 아래)
+LEFT_EYE_OUTLINE = ("left_eye", "left_eye_top", "left_eye_inner", "left_eye_bottom")
+RIGHT_EYE_OUTLINE = ("right_eye", "right_eye_top", "right_eye_inner", "right_eye_bottom")
+MOUTH_OUTLINE = ("mouth_right", "mouth_top", "mouth_left", "mouth_bottom")
 NUM_FACE_KEY_POINTS = len(FACE_KEY_ORDER)
 
 # ---------------------------------------------------------------------------
@@ -129,6 +160,10 @@ FOREARM_LENGTH = 0.25
 NECK_LENGTH = 0.1
 HEAD_OFFSET = 0.12
 ARM_OUTWARD_OFFSET = 0.02
+EYE_HALF_WIDTH = 0.03
+EYE_RAISE = 0.03
+EAR_HALF_WIDTH = 0.07
+EAR_DEPTH = 0.1  # 귀(머리 중심)는 코보다 이만큼 뒤에 있다 (z 양수 = 카메라 반대쪽)
 
 
 def build_neutral_pose() -> np.ndarray:
@@ -159,5 +194,10 @@ def build_neutral_pose() -> np.ndarray:
         -TORSO_LENGTH + UPPER_ARM_LENGTH + FOREARM_LENGTH,
         0.0,
     )
-    pose[NOSE] = (0.0, -TORSO_LENGTH - NECK_LENGTH - HEAD_OFFSET, 0.0)
+    nose_y = -TORSO_LENGTH - NECK_LENGTH - HEAD_OFFSET
+    pose[NOSE] = (0.0, nose_y, 0.0)
+    pose[LEFT_EYE] = (EYE_HALF_WIDTH, nose_y - EYE_RAISE, EAR_DEPTH * 0.2)
+    pose[RIGHT_EYE] = (-EYE_HALF_WIDTH, nose_y - EYE_RAISE, EAR_DEPTH * 0.2)
+    pose[LEFT_EAR] = (EAR_HALF_WIDTH, nose_y, EAR_DEPTH)
+    pose[RIGHT_EAR] = (-EAR_HALF_WIDTH, nose_y, EAR_DEPTH)
     return pose

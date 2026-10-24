@@ -10,7 +10,7 @@ from typing import List, Optional
 import numpy as np
 
 from . import landmarks, retarget, video_io
-from .renderer import CapsuleRenderer
+from .renderer import DEFAULT_FACE_SCALE, CapsuleRenderer
 from .smoothing import EMASmoother
 from .tracker import HolisticTracker, draw_landmarks_overlay
 
@@ -56,6 +56,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-height", type=int, default=720, help="처리용 프레임 최대 세로 픽셀 (기본값 720)"
+    )
+    parser.add_argument(
+        "--face-scale",
+        type=float,
+        default=DEFAULT_FACE_SCALE,
+        help=f"머리·얼굴 확대 배율 (표정 판독용), 기본값 {DEFAULT_FACE_SCALE}",
     )
     parser.add_argument(
         "--export-json", default=None, help="프레임별 3D 관절 좌표를 저장할 JSON 파일 경로"
@@ -105,6 +111,7 @@ def run(args: argparse.Namespace) -> int:
         upper_body=args.upper_body,
         yaw_deg=args.yaw,
         orbit_deg_per_frame=args.orbit,
+        face_scale=args.face_scale,
     )
 
     pose_smoother = EMASmoother(alpha=args.smooth)
@@ -116,6 +123,9 @@ def run(args: argparse.Namespace) -> int:
     json_records: List[dict] = []
     prev_frame_data: Optional[retarget.FrameData] = None
     last_scale: Optional[float] = None
+    # 마지막으로 검출된 얼굴(머리 중심 기준 오프셋)과 그때의 머리 회전. 손이 얼굴을 가리는
+    # 구간에서는 이 얼굴을 머리 회전 변화량만큼 돌려서 계속 그린다.
+    face_ref: Optional[tuple] = None
 
     print(f"입력: {args.input} ({info.width}x{info.height}, {info.fps:.1f}fps, {info.total_frames}프레임)")
     print(f"출력: {out_path} ({'나란히 보기' if args.view == 'side' else '캐릭터만 보기'})")
@@ -140,7 +150,7 @@ def run(args: argparse.Namespace) -> int:
             pose_world = raw.pose_world
             left_hand_world = None
             right_hand_world = None
-            face_world = None
+            face_rel = None
 
             if pose_world is not None:
                 if args.upper_body:
@@ -153,15 +163,20 @@ def run(args: argparse.Namespace) -> int:
                     right_hand_world = retarget.hand_to_world(
                         assigned_right_px, pose_world[landmarks.RIGHT_WRIST], scale
                     )
-                if raw.face_pixel is not None and scale is not None:
-                    face_world = retarget.face_to_world(
-                        raw.face_pixel, pose_world[landmarks.NOSE], scale
-                    )
+                head_rot = retarget.head_rotation_from_pose(pose_world)
+                face_rel = retarget.face_offsets(raw.face_pixel)
+                if face_rel is not None:
+                    face_ref = (face_rel, head_rot)
+                elif face_ref is not None and face_ref[1] is not None and head_rot is not None:
+                    face_rel = retarget.carry_face_offsets(face_ref[0], face_ref[1], head_rot)
 
             smoothed_pose = pose_smoother.update(pose_world)
             smoothed_left = left_hand_smoother.update(left_hand_world)
             smoothed_right = right_hand_smoother.update(right_hand_world)
-            smoothed_face = face_smoother.update(face_world)
+            smoothed_face_rel = face_smoother.update(face_rel)
+            smoothed_face = None
+            if smoothed_pose is not None and smoothed_face_rel is not None:
+                smoothed_face = retarget.head_center(smoothed_pose) + smoothed_face_rel
 
             frame_data = retarget.hold_missing(
                 prev_frame_data, smoothed_pose, smoothed_left, smoothed_right, smoothed_face
