@@ -46,6 +46,11 @@ const info = await page.evaluate((cfg) => AvatarScene.init(cfg), {
 });
 console.error(`model: ${info.humanBones.length} bones, ${info.expressions.length} expressions, style ${JSON.stringify(info.style)}`);
 
+if (job.dumpRest) {
+  await writeFile(job.dumpRest, JSON.stringify(await page.evaluate(() => AvatarScene.dumpRestPose()), null, 1));
+  console.error(`rest pose -> ${job.dumpRest}`);
+}
+
 for (let i = 0; i < job.frames.length; i++) {
   const missing = await page.evaluate((f) => AvatarScene.applyFrame(f), job.frames[i]);
   if (missing.length && i === 0) console.error(`모델에 없는 표정: ${missing.join(", ")}`);

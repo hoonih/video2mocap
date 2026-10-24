@@ -43,13 +43,12 @@ export async function init({ width, height, modelUrl, background, camera, lights
   scene.add(vrm.scene);
   vrm.update(0);
 
-  // camera.followBone이 있으면 그 본의 월드 위치 + offset을 기준으로 잡는다 (모델 키가 달라도 같은 구도)
-  if (camera.followBone) {
-    const anchor = new THREE.Vector3();
-    vrm.humanoid.getNormalizedBoneNode(camera.followBone).getWorldPosition(anchor);
-    cam.position.copy(anchor).add(new THREE.Vector3(...camera.position));
-    cam.lookAt(anchor.clone().add(new THREE.Vector3(...camera.target)));
-  }
+  // camera.followBone이 있으면 그 본의 월드 위치 + offset을 기준으로 잡는다 (모델 키가 달라도 같은 구도).
+  // camera.followEachFrame이면 매 프레임 자세를 적용한 뒤 다시 잡는다 (검증용 손 확대 뷰).
+  state.cameraConfig = camera;
+  state.camera = cam;
+  state.vrm = vrm;
+  if (camera.followBone) placeCamera();
 
   applyStyle(vrm, style || {});
 
@@ -115,14 +114,35 @@ function applyStyle(vrm, style) {
   state.styleReport = report;
 }
 
+// 휴지 자세(정규화 T-포즈)에서 각 휴머노이드 본의 월드 위치. 리타게팅 솔버가 뼈 방향 기준으로 쓴다.
+export function dumpRestPose() {
+  const { vrm } = state;
+  vrm.humanoid.resetNormalizedPose();
+  vrm.update(0);
+  vrm.scene.updateMatrixWorld(true);
+  const positions = {};
+  const v = new THREE.Vector3();
+  for (const bone of Object.keys(vrm.humanoid.humanBones)) {
+    const node = vrm.humanoid.getNormalizedBoneNode(bone);
+    if (node) positions[bone] = node.getWorldPosition(v).toArray();
+  }
+  return { metaVersion: vrm.meta.metaVersion, positions };
+}
+
 // frame: { bones: {boneName: [x,y,z,w] 정규화 본 로컬 쿼터니언}, blendshapes: {arkitName: 0..1} }
 export function applyFrame(frame) {
   const { vrm } = state;
   vrm.humanoid.resetNormalizedPose();
+  // 입력 쿼터니언은 VRM 1.0 정규화 규약(모델 정면 +Z, 모델 왼쪽 +X, 위 +Y)이다.
+  // VRM 0.x 모델의 정규화 본은 X·Z축이 반대라서 (x, y, z, w) → (-x, y, -z, w)로 바꿔 넣는다 (실측 확인).
+  const flip = vrm.meta.metaVersion === "0" ? -1 : 1;
+  const unknownBones = [];
   for (const [bone, q] of Object.entries(frame.bones || {})) {
     const node = vrm.humanoid.getNormalizedBoneNode(bone);
-    if (node) node.quaternion.set(q[0], q[1], q[2], q[3]);
+    if (node) node.quaternion.set(flip * q[0], q[1], flip * q[2], q[3]);
+    else unknownBones.push(bone);
   }
+  if (unknownBones.length) throw new Error(`모델에 없는 본: ${unknownBones.join(", ")}`);
   for (const expr of vrm.expressionManager.expressions) vrm.expressionManager.setValue(expr.expressionName, 0);
   const missing = [];
   for (const [name, value] of Object.entries(frame.blendshapes || {})) {
@@ -135,7 +155,18 @@ export function applyFrame(frame) {
   return missing;
 }
 
+function placeCamera() {
+  const { camera: cfg } = { camera: state.cameraConfig };
+  const anchor = new THREE.Vector3();
+  state.vrm.scene.updateMatrixWorld(true);
+  // 실제 메시를 움직이는 raw 본의 위치를 따른다 (정규화 본은 자세 적용 후 위치가 갱신되지 않을 수 있음)
+  state.vrm.humanoid.getRawBoneNode(cfg.followBone).getWorldPosition(anchor);
+  state.camera.position.copy(anchor).add(new THREE.Vector3(...cfg.position));
+  state.camera.lookAt(anchor.clone().add(new THREE.Vector3(...cfg.target)));
+}
+
 export function renderFrame() {
+  if (state.cameraConfig.followBone && state.cameraConfig.followEachFrame) placeCamera();
   state.renderer.render(state.scene, state.camera);
   return state.renderer.domElement.toDataURL("image/png");
 }

@@ -32,3 +32,4 @@ assets/avatar/*.gltf
 # Node 렌더러
 render/node_modules/
 render/dist/
+assets/avatar/*.rest.json
