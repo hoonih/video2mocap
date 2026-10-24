@@ -82,6 +82,21 @@ SignPost팀 IRB 승인 연구용 자극 영상(조건 A 원본 / B 골격 / C 3D
   - 23%보다 작으면 원본보다 확대해야 해서 화질이 떨어진다 (경고 출력).
 - 화자는 화면 가운데에 서고, 어깨가 화면 높이의 약 40% 지점에 오게 한다.
 
+### 인코딩 (Phase 4)
+
+- 렌더링한 프레임을 ffmpeg stdin으로 바로 넘겨 인코딩한다 (중간 파일 없음).
+- 프리셋: `-c:v libx264 -pix_fmt yuv420p -profile:v baseline -level:v 3.1 -crf 23 -movflags +faststart -an`
+  - 720×1280은 45×80 = 3600 매크로블록으로 level 3.1 한도와 정확히 같다. 이보다 큰 출력 크기를
+    쓰면 level 3.1을 지킬 수 없다.
+  - 디버그용 `side` 뷰(1440×1280)는 level을 지정하지 않으며 모바일 프리셋 검사에서 제외한다.
+- ffmpeg가 없으면 설치 안내와 함께 중단한다. mp4v로 대체하지 않는다.
+- 출력 직후 ffprobe로 코덱·프로파일·레벨·픽셀 포맷·오디오 유무·faststart·실제 프레임 수를 검사하고,
+  하나라도 어긋나면 실패로 처리한다.
+- 16초 기준 파일 크기: A 약 1.0MB, B 약 0.8MB, C 약 0.7MB.
+- **배포 서버는 HTTP Range 요청(206 Partial Content)을 지원해야 한다.** iOS Safari는 Range를
+  지원하지 않는 서버의 동영상을 재생하지 않는다. (Vercel, Netlify, S3, GitHub Pages는 지원.
+  Python 기본 `http.server`는 지원하지 않음.)
+
 ## 3. 원본 촬영 사양
 
 | 항목 | 값 |

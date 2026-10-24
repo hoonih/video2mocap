@@ -7,9 +7,11 @@ import pytest
 import shutil
 import subprocess
 
+from mocap import video_io
 from mocap.video_io import (
     VideoWriter,
     get_video_info,
+    inspect_encoding,
     probe_video,
     read_frames,
     read_frames_cfr,
@@ -71,6 +73,7 @@ def test_read_frames_resizes_when_max_height_smaller(dummy_video):
     assert frames[0].shape[1] == 80
 
 
+@needs_ffmpeg
 def test_video_writer_roundtrip(tmp_path):
     out_path = str(tmp_path / "out.mp4")
     with VideoWriter(out_path, fps=15.0, size=(64, 48)) as writer:
@@ -118,3 +121,46 @@ def test_probe_and_decode_respect_rotation_metadata(tmp_path):
     info = probe_video(rotated)
     assert (info.width, info.height) == (48, 64)
     assert next(read_frames_cfr(rotated, 30.0, info)).shape == (64, 48, 3)
+
+
+@needs_ffmpeg
+def test_video_writer_produces_mobile_web_h264(tmp_path):
+    out_path = str(tmp_path / "web.mp4")
+    rng = np.random.default_rng(0)
+    with VideoWriter(out_path, fps=30.0, size=(720, 1280)) as writer:
+        for _ in range(17):
+            writer.write(rng.integers(0, 255, size=(1280, 720, 3), dtype=np.uint8))
+
+    enc = inspect_encoding(out_path)
+    assert enc.web_problems() == []
+    assert (enc.codec, enc.pix_fmt, enc.level) == ("h264", "yuv420p", 31)
+    assert "Baseline" in enc.profile
+    assert (enc.width, enc.height, enc.fps, enc.frames) == (720, 1280, 30.0, 17)  # 프레임 수 보존
+    assert not enc.has_audio
+    assert enc.faststart
+
+
+@needs_ffmpeg
+def test_video_writer_omits_level_when_frame_exceeds_level_31(tmp_path):
+    out_path = str(tmp_path / "wide.mp4")
+    with VideoWriter(out_path, fps=30.0, size=(1440, 1280)) as writer:
+        writer.write(np.zeros((1280, 1440, 3), dtype=np.uint8))
+    enc = inspect_encoding(out_path)
+    assert enc.codec == "h264" and enc.faststart
+
+
+def test_video_writer_reports_missing_ffmpeg(tmp_path, monkeypatch):
+    monkeypatch.setattr(video_io.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="brew install ffmpeg"):
+        VideoWriter(str(tmp_path / "x.mp4"), fps=30.0, size=(64, 48))
+    assert not os.path.exists(tmp_path / "x.mp4")  # mp4v 등으로 몰래 대체하지 않음
+
+
+@needs_ffmpeg
+def test_video_writer_rejects_odd_size_and_wrong_frame(tmp_path):
+    with pytest.raises(ValueError):
+        VideoWriter(str(tmp_path / "odd.mp4"), fps=30.0, size=(65, 48))
+    with VideoWriter(str(tmp_path / "ok.mp4"), fps=30.0, size=(64, 48)) as writer:
+        with pytest.raises(ValueError):
+            writer.write(np.zeros((10, 10, 3), dtype=np.uint8))
+        writer.write(np.zeros((48, 64, 3), dtype=np.uint8))

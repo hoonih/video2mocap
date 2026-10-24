@@ -360,11 +360,23 @@ def run(args: argparse.Namespace) -> int:
         sources.close()
     sys.stdout.write("\n")
 
-    # -- 프레임 수 검증 -----------------------------------------------------------
-    if written != n_frames:
-        print(f"오류: 출력 프레임 수({written})가 입력({n_frames})과 다릅니다.", file=sys.stderr)
+    # -- 출력 검증: 프레임 수와 웹 재생 프리셋 ------------------------------------------
+    enc = video_io.inspect_encoding(out_path)
+    if not (written == enc.frames == n_frames):
+        print(
+            f"오류: 프레임 수 불일치 (입력 {n_frames}, 인코더 입력 {written}, 출력 파일 {enc.frames})",
+            file=sys.stderr,
+        )
         return 1
-    print(f"처리 완료. 프레임 수 검증: 입력 {n_frames} = 출력 {written}")
+    problems = enc.web_problems()
+    if problems and args.view != "side":
+        print(f"오류: 모바일 웹 재생 조건 위반: {', '.join(problems)}", file=sys.stderr)
+        return 1
+    print(
+        f"처리 완료. 프레임 수 검증: 입력 {n_frames} = 출력 {enc.frames} / "
+        f"{enc.codec} {enc.profile} L{enc.level / 10:.1f} {enc.pix_fmt}, faststart={enc.faststart}"
+        + (" (side 뷰는 level 3.1 한도 초과라 모바일 프리셋 검사 제외)" if args.view == "side" else "")
+    )
 
     if args.export_json:
         with open(args.export_json, "w", encoding="utf-8") as f:
