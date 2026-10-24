@@ -85,20 +85,31 @@ function applyStyle(vrm, style) {
     });
   }
   if (style.hideBangs) {
+    // 눈썹 영역(양 눈 바깥 + margin, 눈 위 browLow~browHigh 미터)을 앞에서 가리는 머리카락 가닥만 숨긴다.
     const head = new THREE.Vector3();
+    const leftEye = new THREE.Vector3();
+    const rightEye = new THREE.Vector3();
     vrm.humanoid.getNormalizedBoneNode("head").getWorldPosition(head);
-    const brow = new THREE.Vector3();
-    // 눈썹 높이: 왼눈 본 위 hideBangs.aboveEye 미터
-    vrm.humanoid.getNormalizedBoneNode("leftEye").getWorldPosition(brow);
-    const cutoffY = brow.y + style.hideBangs.aboveEye;
+    vrm.humanoid.getNormalizedBoneNode("leftEye").getWorldPosition(leftEye);
+    vrm.humanoid.getNormalizedBoneNode("rightEye").getWorldPosition(rightEye);
+    const { margin, browLow, browHigh, frontOffset } = style.hideBangs;
+    const eyeY = (leftEye.y + rightEye.y) / 2;
+    const region = {
+      minX: Math.min(leftEye.x, rightEye.x) - margin, maxX: Math.max(leftEye.x, rightEye.x) + margin,
+      minY: eyeY + browLow, maxY: eyeY + browHigh,
+    };
     vrm.scene.traverse((obj) => {
-      if (!obj.isMesh || !/HAIR/.test([].concat(obj.material)[0].name) || /HairBack/.test([].concat(obj.material)[0].name)) return;
-      obj.geometry.computeBoundingBox();
-      const box = obj.geometry.boundingBox.clone().applyMatrix4(obj.matrixWorld);
-      const inFront = box.max.z > head.z + style.hideBangs.frontOffset;
-      const reachesBrow = box.min.y < cutoffY && box.max.y > cutoffY - 0.1;
-      const central = Math.abs((box.min.x + box.max.x) / 2 - head.x) < style.hideBangs.halfWidth;
-      if (inFront && reachesBrow && central) { obj.visible = false; report.hiddenHairPrimitives++; }
+      if (!obj.isMesh) return;
+      const name = [].concat(obj.material)[0].name;
+      if (!/_HAIR$/.test(name) || /HairBack/.test(name)) return;
+      const pos = obj.geometry.attributes.position;
+      const v = new THREE.Vector3();
+      let covers = false;
+      for (let i = 0; i < pos.count && !covers; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(obj.matrixWorld);
+        covers = v.z > head.z + frontOffset && v.x > region.minX && v.x < region.maxX && v.y > region.minY && v.y < region.maxY;
+      }
+      if (covers) { obj.visible = false; report.hiddenHairPrimitives++; }
     });
   }
   state.styleReport = report;

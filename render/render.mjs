@@ -13,6 +13,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const job = JSON.parse(await readFile(process.argv[2], "utf8"));
 await mkdir(job.outDir, { recursive: true });
 
+// 알 수 없는 프레임 키는 조용히 무시하지 않고 오류로 처리한다 (오타로 표정이 통째로 빠지는 것 방지)
+const FRAME_KEYS = new Set(["bones", "blendshapes", "dt"]);
+job.frames.forEach((frame, i) => {
+  const unknown = Object.keys(frame).filter((k) => !FRAME_KEYS.has(k));
+  if (unknown.length) throw new Error(`frames[${i}]에 알 수 없는 키: ${unknown.join(", ")} (허용: ${[...FRAME_KEYS].join(", ")})`);
+});
+
 // GPU에 따라 결과가 달라지지 않도록 소프트웨어 GL(SwiftShader)을 고정한다.
 const browser = await chromium.launch({
   args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
