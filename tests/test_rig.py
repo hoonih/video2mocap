@@ -202,3 +202,89 @@ def test_reconcile_forearm_depth_only_fixes_implausible_wrist():
     fixed = rig.reconcile_forearm_depth(severe, hand)
     assert fixed[:2] == pytest.approx(severe[:2])
     assert _angle_deg(fixed, hand) == pytest.approx(rig.RECONCILE_WRIST_DEG, abs=0.1)
+
+
+# --- 얼굴 접촉 위치 보정 (IK) -----------------------------------------------------
+
+def test_two_bone_ik_reaches_target_and_keeps_lengths():
+    s, e, w = np.array([0.1, 1.3, 0.0]), np.array([0.3, 1.1, 0.1]), np.array([0.35, 1.3, 0.25])
+    target = np.array([0.2, 1.45, 0.2])
+    ne, nw = rig.two_bone_ik(s, e, w, target)
+    assert np.linalg.norm(ne - s) == pytest.approx(np.linalg.norm(e - s))
+    assert np.linalg.norm(nw - ne) == pytest.approx(np.linalg.norm(w - e))
+    assert nw == pytest.approx(target, abs=1e-6)
+
+
+def _rest_with_face():
+    rest = _synthetic_rest()
+    head = rest.positions["head"]
+    # 애니메이션풍 비율: 눈꼬리 간격 넓고 눈~턱이 짧다
+    rest.face_anchors = {
+        "eyeOuterLeft": head + [0.068, 0.055, 0.06], "eyeOuterRight": head + [-0.068, 0.055, 0.06],
+        "noseTip": head + [0, 0.02, 0.11], "mouth": head + [0, 0.005, 0.10], "chin": head + [0, -0.035, 0.08],
+        "forehead": head + [0, 0.2, 0.04],
+    }
+    return rest
+
+
+_PX_PER_M = 1000.0
+
+
+def _to_image(points_model):
+    """모델 좌표 → 정면 정사영 영상 픽셀 (x 오른쪽, y 아래)."""
+    p = np.atleast_2d(points_model)
+    return np.stack([p[:, 0] * _PX_PER_M, -p[:, 1] * _PX_PER_M], axis=1)
+
+
+def _human_face_model(center):
+    """사람 비율의 얼굴 점 (모델 좌표, FACE_KEY_ORDER 순서). center는 머리 중심."""
+    k = landmarks.FACE_KEY_ORDER
+    pts = {name: np.zeros(3) for name in k}
+    pts.update({"left_eye": [0.045, 0.06, 0.07], "right_eye": [-0.045, 0.06, 0.07], "nose_tip": [0, 0.02, 0.11],
+                "mouth_top": [0, -0.02, 0.095], "mouth_bottom": [0, -0.03, 0.095], "chin": [0, -0.065, 0.085],
+                "forehead": [0, 0.13, 0.08], "face_left_edge": [0.07, 0.02, 0.0], "face_right_edge": [-0.07, 0.02, 0.0]})
+    return np.array([np.asarray(center) + np.asarray(pts[n], float) for n in k])
+
+
+def test_face_mapping_sends_anchors_to_anchors():
+    rest = _rest_with_face()
+    ik = rig.FaceContactIK(rest)
+    face_img = _to_image(_human_face_model(np.array([0.0, 1.5, 0.0])))
+    human = ik._human_anchors_2d(face_img)
+    pos, rot = rig.forward_kinematics(rest, {})
+    model = ik._model_anchors(pos, rot)
+    for name in ("eyeLeft", "eyeRight", "mouth", "chin"):
+        pt = face_img[landmarks.FACE_KEY_ORDER.index({"eyeLeft": "left_eye", "eyeRight": "right_eye", "chin": "chin"}.get(name, "mouth_top"))]
+        if name == "mouth":
+            k = landmarks.FACE_KEY_ORDER.index
+            pt = (face_img[k("mouth_top")] + face_img[k("mouth_bottom")]) / 2
+        far = model[name] + np.array([0, 0, 0.2])          # 손이 얼굴 앞 20cm에 있어도
+        mapped = ik.map_point_2d(pt, human, model, current=far)
+        origin, basis, _ = rig._face_frame(model["eyeLeft"], model["eyeRight"], model["chin"])
+        surface = origin + basis @ (basis.T @ (model[name] - origin) + [0, 0, rig.FACE_CONTACT_SURFACE_GAP])
+        assert mapped[:2] == pytest.approx(surface[:2], abs=1e-6), name   # 화면 평면 위치는 그 기준점
+        assert mapped[2] == pytest.approx(far[2]), name                     # 깊이는 현재 값 유지
+
+
+def test_fingertip_touching_chin_lands_on_model_chin():
+    """영상에서 사람 검지 끝이 턱에 닿음 → IK 후 모델 검지 끝이 (정면에서 보아) 모델 턱 위치."""
+    rest = _rest_with_face()
+    pose_local = {"rightUpperArm": _ax([0, 0, 1], 70) @ _ax([0, 1, 0], 30), "rightLowerArm": _ax([0, 1, 0], 120)}
+    frame, _, _ = _landmarks_from_fk(pose_local)
+    tip = frame.right_hand[8] * np.array([1.0, -1.0, -1.0])
+    face = _human_face_model(tip - np.array([0, -0.065, 0.085]))   # 검지 끝이 정확히 사람 턱에 오도록
+    frame.face_image = _to_image(face)
+    frame.right_hand_image = _to_image(frame.right_hand * np.array([1.0, -1.0, -1.0]))
+
+    def model_tip(solver):
+        out = solver.solve(frame)
+        pos, rot = rig.forward_kinematics(rest, out.bones)
+        seg = rest.positions["rightIndexDistal"] - rest.positions["rightIndexIntermediate"]
+        return pos["rightIndexDistal"] + rot["rightIndexDistal"] @ seg, out, pos, rot
+
+    with_ik, out, pos, rot = model_tip(rig.RigSolver(rest, face_contact=True))
+    without_ik, _, _, _ = model_tip(rig.RigSolver(rest, face_contact=False))
+    model_chin = rig.FaceContactIK(rest)._model_anchors(pos, rot)["chin"]
+    assert out.contact["right"] == pytest.approx(1.0)
+    assert np.linalg.norm((with_ik - model_chin)[:2]) < 0.003       # 정면에서 본 위치
+    assert np.linalg.norm((without_ik - model_chin)[:2]) > 0.01      # FK만이면 어긋남

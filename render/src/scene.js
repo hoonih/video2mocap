@@ -129,7 +129,49 @@ export function dumpRestPose() {
     const node = vrm.humanoid.getNormalizedBoneNode(bone);
     if (node) positions[bone] = node.getWorldPosition(v).toArray();
   }
-  return { metaVersion: vrm.meta.metaVersion, positions };
+  return { metaVersion: vrm.meta.metaVersion, positions, faceAnchors: faceAnchors(vrm) };
+}
+
+// 얼굴 접촉 위치 매핑(mocap/rig.py FaceContactIK)용 얼굴 기준점: 휴지 자세 메시 정점에서 찾는다.
+//  eyeOuterLeft/Right: 흰자 메시의 좌우 끝, noseTip: 얼굴 정중선에서 가장 앞, chin: 정중선 앞쪽에서 가장 아래,
+//  forehead: 정중선 앞쪽에서 가장 위, mouth: jawOpen 모프가 가장 크게 움직이는 정중선 정점들의 가장 위(입술선)
+function faceAnchors(vrm) {
+  const head = new THREE.Vector3();
+  vrm.humanoid.getNormalizedBoneNode("head").getWorldPosition(head);
+  const v = new THREE.Vector3();
+  const collect = (pattern) => {
+    const out = [];
+    vrm.scene.traverse((obj) => {
+      if (!obj.isMesh || !pattern.test([].concat(obj.material)[0].name)) return;
+      const pos = obj.geometry.attributes.position;
+      for (let i = 0; i < pos.count; i++) {
+        if (obj.isSkinnedMesh) obj.getVertexPosition(i, v); else v.fromBufferAttribute(pos, i);
+        out.push({ p: obj.localToWorld(v.clone()), obj, i });
+      }
+    });
+    return out;
+  };
+  const MIDLINE = 0.004;
+  const eyes = collect(/EyeWhite/);
+  const skin = collect(/Face_00_SKIN/).filter((e) => Math.abs(e.p.x - head.x) < MIDLINE && e.p.z > head.z);
+  const pick = (arr, key) => arr.reduce((a, b) => (key(b) > key(a) ? b : a)).p.toArray();
+  // jawOpen 모프 변위가 큰 정중선 정점
+  let mouth = null;
+  const jaw = skin.filter((e) => e.obj.morphTargetDictionary && "jawOpen" in e.obj.morphTargetDictionary);
+  if (jaw.length) {
+    const disp = jaw.map((e) => {
+      const attr = e.obj.geometry.morphAttributes.position[e.obj.morphTargetDictionary.jawOpen];
+      return { e, d: new THREE.Vector3().fromBufferAttribute(attr, e.i).length() };
+    });
+    const maxD = Math.max(...disp.map((x) => x.d));
+    const moving = disp.filter((x) => x.d > 0.3 * maxD).map((x) => x.e);
+    if (moving.length) mouth = pick(moving, (e) => e.p.y);
+  }
+  return {
+    eyeOuterLeft: pick(eyes, (e) => e.p.x), eyeOuterRight: pick(eyes, (e) => -e.p.x),
+    noseTip: pick(skin, (e) => e.p.z), chin: pick(skin, (e) => -e.p.y), forehead: pick(skin, (e) => e.p.y),
+    mouth,
+  };
 }
 
 // frame: { bones: {boneName: [x,y,z,w] 정규화 본 로컬 쿼터니언}, blendshapes: {arkitName: 0..1} }

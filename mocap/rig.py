@@ -199,12 +199,16 @@ class RestPose:
     """모델의 정규화 휴지 자세에서 본의 월드 위치 (VRM 1.0 규약 좌표)."""
 
     positions: Dict[str, np.ndarray]
+    face_anchors: Optional[Dict[str, np.ndarray]] = None  # 얼굴 접촉 매핑용 (render.mjs faceAnchors)
 
     @classmethod
     def load(cls, path: str) -> "RestPose":
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return cls({k: np.asarray(v, dtype=np.float64) for k, v in data["positions"].items()})
+        anchors = data.get("faceAnchors")
+        if anchors is not None:
+            anchors = {k: np.asarray(v, dtype=np.float64) for k, v in anchors.items() if v is not None}
+        return cls({k: np.asarray(v, dtype=np.float64) for k, v in data["positions"].items()}, anchors)
 
     def direction(self, bone: str, child: str) -> np.ndarray:
         return _normalize(self.positions[child] - self.positions[bone])
@@ -233,15 +237,17 @@ def _palm_normal(wrist: np.ndarray, index_mcp: np.ndarray, little_mcp: np.ndarra
 class RigFrame:
     bones: Dict[str, List[float]]                       # 본 이름 → [x, y, z, w]
     violations: List[str] = field(default_factory=list)  # 클램프한 해부학적 한계 위반
+    contact: Dict[str, float] = field(default_factory=dict)  # 손별 얼굴 접촉 IK 가중치 (0~1)
 
 
 class RigSolver:
     """프레임 순서대로 호출한다 (팔이 펴졌을 때 위팔 비틀림을 직전 값으로 유지하기 위한 상태)."""
 
-    def __init__(self, rest: RestPose) -> None:
+    def __init__(self, rest: RestPose, face_contact: bool = True) -> None:
         self.rest = rest
         self._prev_elbow_ref: Dict[str, np.ndarray] = {}
         self._prev_palm: Dict[str, np.ndarray] = {}
+        self._contact = FaceContactIK(rest) if face_contact and rest.face_anchors else None
 
     def solve(self, frame: FrameData) -> RigFrame:
         violations: List[str] = []
@@ -253,7 +259,8 @@ class RigSolver:
         for side in ("left", "right"):
             hand = frame.left_hand if side == "left" else frame.right_hand
             self._arm(side, pose, None if hand is None else hand * _MP_TO_MODEL, chest, bones, violations)
-        return RigFrame(bones={k: to_quaternion(v) for k, v in bones.items()}, violations=violations)
+        contact = self._contact.apply(frame, bones) if self._contact is not None else {}
+        return RigFrame(bones={k: to_quaternion(v) for k, v in bones.items()}, violations=violations, contact=contact)
 
     # -- 몸통·머리 -------------------------------------------------------------
 
@@ -430,6 +437,199 @@ class RigSolver:
     def _distal_direction(self, distal: str, parent: str) -> np.ndarray:
         """끝마디는 자식 본이 없으므로 휴지 자세 방향을 부모 마디 방향과 같다고 본다."""
         return self.rest.direction(parent, distal)
+
+
+# ---------------------------------------------------------------------------
+# 얼굴 접촉 위치 보정 (IK)
+# ---------------------------------------------------------------------------
+# 각도만 옮기면(FK) 모델과 사람의 신체 비율이 달라 손이 닿는 얼굴 위치가 어긋난다 (예: 사람은 턱, 모델은 볼).
+# 수어에서 위치는 음운 자질이므로, 손이 얼굴 가까이 있을 때만 '얼굴 기준 상대 위치'를 모델 얼굴로 옮기고
+# 팔을 2관절 IK로 고쳐 손의 그 지점이 목표에 닿게 한다. 손 방향·손 모양은 그대로 둔다.
+#
+# 손과 얼굴의 상대 위치는 영상 2D에서 잰다 (3D에서는 손·얼굴을 따로 붙여 수 cm 어긋남).
+# 얼굴 좌표계: 원점 = 양 눈꼬리 중점, x = 왼쪽 눈꼬리 방향, y = 위(턱→눈 방향의 x 수직 성분), z = 정면.
+# 가로는 눈꼬리 간격으로 정규화하고, 세로는 기준점(눈·코끝·입·턱) 사이를 구간별 선형으로 옮긴다
+# (모델은 애니메이션풍이라 눈~턱이 눈꼬리 간격의 0.64배, 사람은 약 1.36배로 비율이 크게 다르다).
+FACE_CONTACT_FULL = 0.35   # 손이 얼굴 점에서 눈꼬리 간격 × 이 값 안이면 완전히 보정
+FACE_CONTACT_NONE = 1.0    # 이 값 밖이면 보정하지 않음 (사이는 부드럽게)
+FACE_CONTACT_SMOOTH = 0.5  # 보정량 EMA (접촉 지점이 바뀔 때 튀지 않게)
+FACE_CONTACT_SURFACE_GAP = 0.005  # 손 지점을 얼굴 표면보다 최소 이만큼 앞에 둔다 (m)
+_EFFECTOR_POINTS = (4, 8, 12, 16, 20, 5, 9)  # 손끝 5개 + 검지·중지 MCP
+_VERTICAL_ANCHORS = ("eyes", "noseTip", "mouth", "chin")  # 위 → 아래
+
+
+def _hand_point_bone(side: str, idx: int) -> Tuple[str, Optional[str]]:
+    """MediaPipe 손 랜드마크 → (모델 본, 손끝이면 그 부모 본). 손끝은 끝마디를 연장한 점이다."""
+    if idx == 0:
+        return f"{side}Hand", None
+    if idx <= 4:
+        segs = ("ThumbMetacarpal", "ThumbProximal", "ThumbDistal")
+        base = 1
+    else:
+        finger = {5: "Index", 9: "Middle", 13: "Ring", 17: "Little"}[(idx - 1) // 4 * 4 + 1]
+        segs = (f"{finger}Proximal", f"{finger}Intermediate", f"{finger}Distal")
+        base = (idx - 1) // 4 * 4 + 1
+    k = idx - base
+    if k < 3:
+        return f"{side}{segs[k]}", None
+    return f"{side}{segs[2]}", f"{side}{segs[1]}"  # 손끝
+
+
+def _face_frame(eye_left, eye_right, chin):
+    origin = (eye_left + eye_right) / 2.0
+    x = _normalize(eye_left - eye_right)
+    up = origin - chin
+    y = _normalize(up - np.dot(up, x) * x)
+    return origin, np.stack([x, y, np.cross(x, y)], axis=1), float(np.linalg.norm(eye_left - eye_right))
+
+
+def _map_vertical(v: float, src: List[float], dst: List[float], scale: float) -> float:
+    """src 기준점 높이(위→아래)를 dst로 구간별 선형 매핑. 범위 밖은 끝 기준점에서 scale 비율로 연장."""
+    if v >= src[0]:
+        return dst[0] + (v - src[0]) * scale
+    for (s0, s1), (d0, d1) in zip(zip(src, src[1:]), zip(dst, dst[1:])):
+        if v >= s1:
+            t = (v - s0) / (s1 - s0) if abs(s1 - s0) > 1e-9 else 0.0
+            return d0 + t * (d1 - d0)
+    return dst[-1] + (v - src[-1]) * scale
+
+
+def two_bone_ik(shoulder, elbow, wrist, target) -> Tuple[np.ndarray, np.ndarray]:
+    """위팔·아래팔 길이를 지키며 손목을 target에 보내는 새 (팔꿈치, 손목). 팔꿈치는 현재 굽은 쪽을 유지."""
+    a, b = np.linalg.norm(elbow - shoulder), np.linalg.norm(wrist - elbow)
+    t = target - shoulder
+    dist = float(np.clip(np.linalg.norm(t), abs(a - b) + 1e-4, a + b - 1e-4))
+    direction = _normalize(t)
+    pole = (elbow - shoulder) - np.dot(elbow - shoulder, direction) * direction
+    if np.linalg.norm(pole) < 1e-6:
+        pole = np.cross(direction, UP) if abs(np.dot(direction, UP)) < 0.99 else np.cross(direction, FORWARD)
+    pole = _normalize(pole)
+    cos_a = np.clip((a * a + dist * dist - b * b) / (2 * a * dist), -1.0, 1.0)
+    new_elbow = shoulder + a * (cos_a * direction + math.sqrt(1 - cos_a * cos_a) * pole)
+    return new_elbow, shoulder + dist * direction
+
+
+def _min_rotation(u: np.ndarray, v: np.ndarray) -> np.ndarray:
+    axis = np.cross(u, v)
+    angle = math.atan2(np.linalg.norm(axis), float(np.dot(u, v)))
+    return np.eye(3) if np.linalg.norm(axis) < 1e-12 else axis_angle(axis, angle)
+
+
+class FaceContactIK:
+    def __init__(self, rest: RestPose) -> None:
+        self.rest = rest
+        fa = rest.face_anchors
+        self._model_rest = {
+            "eyeLeft": fa["eyeOuterLeft"], "eyeRight": fa["eyeOuterRight"],
+            "noseTip": fa["noseTip"], "mouth": fa["mouth"], "chin": fa["chin"],
+        }
+        self._delta: Dict[str, np.ndarray] = {}
+
+    @staticmethod
+    def _human_anchors_2d(face_image: np.ndarray) -> Dict[str, np.ndarray]:
+        """영상 픽셀 좌표의 얼굴 기준점. y를 위로 뒤집어 모델 화면 방향(위 +)과 맞춘다."""
+        k = landmarks.FACE_KEY_ORDER.index
+        f = face_image * np.array([1.0, -1.0])
+        return {
+            "eyeLeft": f[k("left_eye")], "eyeRight": f[k("right_eye")], "noseTip": f[k("nose_tip")],
+            "mouth": (f[k("mouth_top")] + f[k("mouth_bottom")]) / 2.0, "chin": f[k("chin")],
+        }
+
+    def _model_anchors(self, positions, rotations) -> Dict[str, np.ndarray]:
+        head_rest = self.rest.positions["head"]
+        return {name: positions["head"] + rotations["head"] @ (p - head_rest) for name, p in self._model_rest.items()}
+
+    @staticmethod
+    def _frame2d(anchors):
+        """2D 얼굴 좌표계: 원점 눈꼬리 중점, x = 왼쪽 눈꼬리 방향, y = 그 수직(턱→눈 쪽)."""
+        origin = (anchors["eyeLeft"] + anchors["eyeRight"]) / 2.0
+        x = _normalize(anchors["eyeLeft"] - anchors["eyeRight"])
+        y = np.array([-x[1], x[0]])
+        if np.dot(origin - anchors["chin"], y) < 0:
+            y = -y
+        span = float(np.linalg.norm(anchors["eyeLeft"] - anchors["eyeRight"]))
+        heights = [0.0] + [float(np.dot(anchors[n] - origin, y)) for n in _VERTICAL_ANCHORS[1:]]
+        return origin, x, y, span, heights
+
+    @staticmethod
+    def _coords(anchors):
+        origin, basis, span = _face_frame(anchors["eyeLeft"], anchors["eyeRight"], anchors["chin"])
+        heights = [0.0] + [float(np.dot(anchors[n] - origin, basis[:, 1])) for n in _VERTICAL_ANCHORS[1:]]
+        depths = [0.0] + [float(np.dot(anchors[n] - origin, basis[:, 2])) for n in _VERTICAL_ANCHORS[1:]]
+        return origin, basis, span, heights, depths
+
+    @staticmethod
+    def _surface_depth(v: float, heights: List[float], depths: List[float]) -> float:
+        """정중선 기준점(눈·코끝·입·턱)의 깊이를 높이 v에서 구간별 선형 보간 (범위 밖은 끝값)."""
+        if v >= heights[0]:
+            return depths[0]
+        for (h0, h1), (d0, d1) in zip(zip(heights, heights[1:]), zip(depths, depths[1:])):
+            if v >= h1:
+                t = (v - h0) / (h1 - h0) if abs(h1 - h0) > 1e-9 else 0.0
+                return d0 + t * (d1 - d0)
+        return depths[-1]
+
+    def map_point_2d(self, point_2d, human_2d, model, current) -> np.ndarray:
+        """영상 속 손 지점의 '얼굴 기준 2D 위치'를 모델 얼굴 평면의 대응 위치로 옮긴다.
+
+        깊이는 모델의 현재 깊이(카메라 시선 방향 = 월드 z)를 유지하되, 얼굴 표면보다 뒤(얼굴을 뚫음)면 표면 앞으로
+        꺼낸다. 2D로는 손이 얼굴에 닿았는지 바로 앞에 있는지 알 수 없지만 정면 카메라에서는 깊이가 보이지 않는다.
+        깊이를 얼굴 정면 방향으로 옮기면 얼굴이 기울어 있어(턱이 앞으로 나옴) 화면상 위치가 밀리므로 월드 z로 옮긴다.
+        """
+        ho, hx, hy, hs, hh = self._frame2d(human_2d)
+        mo, mb, ms, mh, md = self._coords(model)
+        rel = point_2d * np.array([1.0, -1.0]) - ho
+        u = float(np.dot(rel, hx)) / hs * ms
+        v = _map_vertical(float(np.dot(rel, hy)) / hs * ms, [h / hs * ms for h in hh], mh, 1.0)
+        on_surface = mo + mb @ np.array([u, v, self._surface_depth(v, mh, md) + FACE_CONTACT_SURFACE_GAP])
+        target = on_surface.copy()
+        target[2] = max(float(current[2]), float(on_surface[2]))
+        return target
+
+    def apply(self, frame: FrameData, bones: Dict[str, np.ndarray]) -> Dict[str, float]:
+        if frame.face_image is None:
+            self._delta.clear()
+            return {}
+        human = self._human_anchors_2d(frame.face_image)
+        face_pts = frame.face_image
+        hspan = float(np.linalg.norm(human["eyeLeft"] - human["eyeRight"]))
+        weights: Dict[str, float] = {}
+        for side in ("left", "right"):
+            hand = frame.left_hand_image if side == "left" else frame.right_hand_image
+            if hand is None or f"{side}UpperArm" not in bones or hspan < 1e-6:
+                self._delta.pop(side, None)
+                continue
+            # 영상에서 얼굴에 가장 가까운 손 지점 (거리는 눈꼬리 간격 단위)
+            dist, idx = min((float(np.min(np.linalg.norm(face_pts - hand[i], axis=1))), i) for i in _EFFECTOR_POINTS)
+            t = float(np.clip((FACE_CONTACT_NONE - dist / hspan) / (FACE_CONTACT_NONE - FACE_CONTACT_FULL), 0, 1))
+            weight = t * t * (3 - 2 * t)
+            positions, rotations = forward_kinematics(self.rest, bones)
+            delta = np.zeros(3)
+            if weight > 0:
+                bone, parent = _hand_point_bone(side, idx)
+                current = positions[bone]
+                if parent is not None:  # 손끝: 끝마디 방향으로 마디 길이만큼 연장
+                    current = current + rotations[bone] @ (self.rest.positions[bone] - self.rest.positions[parent])
+                target = self.map_point_2d(hand[idx], human, self._model_anchors(positions, rotations), current)
+                delta = weight * (target - current)
+            prev = self._delta.get(side)
+            if prev is not None:
+                delta = FACE_CONTACT_SMOOTH * prev + (1 - FACE_CONTACT_SMOOTH) * delta
+            self._delta[side] = delta
+            weights[side] = weight
+            if np.linalg.norm(delta) < 1e-6:
+                continue
+            s, e, w = positions[f"{side}UpperArm"], positions[f"{side}LowerArm"], positions[f"{side}Hand"]
+            new_e, new_w = two_bone_ik(s, e, w, w + delta)
+            r1 = _min_rotation(_normalize(e - s), _normalize(new_e - s))
+            r2 = _min_rotation(_normalize(r1 @ (w - e)), _normalize(new_w - new_e))
+            g_upper = r1 @ rotations[f"{side}UpperArm"]
+            g_fore = r2 @ r1 @ rotations[f"{side}LowerArm"]
+            bones[f"{side}UpperArm"] = rotations[f"{side}Shoulder"].T @ g_upper
+            bones[f"{side}LowerArm"] = g_upper.T @ g_fore
+            if f"{side}Hand" in bones:
+                bones[f"{side}Hand"] = g_fore.T @ rotations[f"{side}Hand"]  # 손의 전역 방향은 그대로
+        return weights
 
 
 # ---------------------------------------------------------------------------

@@ -222,6 +222,16 @@ class _Retargeter:
                 frame_data,
                 face_blendshapes={n: float(v) for n, v in zip(landmarks.BLENDSHAPE_NAMES, smoothed_coeffs)},
             )
+        face_image = None
+        if raw.face_pixel is not None:
+            idxs = [landmarks.FACE_KEY_INDICES[n] for n in landmarks.FACE_KEY_ORDER]
+            face_image = raw.face_pixel[idxs, :2].copy()
+        frame_data = replace(
+            frame_data,
+            face_image=face_image,
+            left_hand_image=None if assigned_left_px is None else assigned_left_px[:, :2].copy(),
+            right_hand_image=None if assigned_right_px is None else assigned_right_px[:, :2].copy(),
+        )
         self.prev_frame_data = frame_data
         return frame_data
 
@@ -235,6 +245,7 @@ class TrackResult:
     frames: List[retarget.FrameData]
     raws: list                      # tracker.RawLandmarks, 프레임별
     pixel_size: Tuple[int, int]     # 추적에 쓴 프레임 크기 (width, height)
+    path: str = ""                  # 입력 영상 경로 (2패스에서 다시 디코딩할 때)
 
 
 def track_video(
@@ -277,7 +288,7 @@ def track_video(
         if face_tracker is not None:
             face_tracker.close()
     sys.stdout.write("\n")
-    return TrackResult(probe=probe, fps=fps, frames=frames, raws=raws, pixel_size=pixel_size)
+    return TrackResult(probe=probe, fps=fps, frames=frames, raws=raws, pixel_size=pixel_size, path=path)
 
 
 def compute_framing(
@@ -333,11 +344,21 @@ def _plan_model_frames(track: TrackResult, target: framing.FramingTarget, transf
     shoulders = framing.shoulder_track([r.pose_pixel for r in track.raws], track.pixel_size, source_size)
     a_widths = frontal = None
     if shoulders is not None:
-        a_widths = shoulders.widths * transform.scale  # 조건 A 화면에서의 어깨너비 (px)
+        a_widths = shoulders.widths * transform.scale  # 조건 A 화면에서의 어깨점 너비 (px)
         frontal = shoulders.frontal_mask()
+        # 보이는 어깨(실루엣) 너비를 맞춘다: 모델 관절 너비 목표 = A 어깨점 너비 × (사람 비율 / 모델 비율)
+        model_ratio = model_render.model_silhouette_ratio(model_path, rest)
+        human_ratio = model_render.human_silhouette_ratio(track.path, track.raws, frontal, track.fps, track.probe)
+        if human_ratio is None:
+            print("경고: 원본 실루엣을 잴 정면 프레임이 없어 어깨 관절 너비로 맞춥니다.", file=sys.stderr)
+        else:
+            a_widths = a_widths * human_ratio / model_ratio
+            print(f"어깨 실루엣 비율: 원본 {human_ratio:.3f}, 모델 {model_ratio:.3f} → 모델 관절 너비 {human_ratio / model_ratio:.3f}배")
     plan = model_render.plan_model_render(track.frames, rest, target, a_widths, frontal)
     over = sum(1 for r in plan.rigs if r.violations)
-    print(f"리그: 해부학적 한계를 넘어 클램프한 프레임 {over}/{len(plan.rigs)} ({over / max(len(plan.rigs), 1):.1%})")
+    contact = sum(1 for r in plan.rigs if any(w > 0 for w in r.contact.values()))
+    print(f"리그: 해부학적 한계를 넘어 클램프한 프레임 {over}/{len(plan.rigs)} ({over / max(len(plan.rigs), 1):.1%}), "
+          f"얼굴 접촉 보정 프레임 {contact}")
     print("3D 렌더 중 (헤드리스 Chromium)...")
     return model_render.render_plan(plan, model_path)
 

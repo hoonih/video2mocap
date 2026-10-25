@@ -59,11 +59,108 @@ def _run_node(job: dict, workdir: str) -> None:
 def ensure_rest_pose(model_path: str) -> rig.RestPose:
     """모델의 휴지 자세 본 위치를 읽는다. 없으면 렌더러로 덤프해 모델 옆에 저장한다."""
     path = rest_pose_path(model_path)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            if "faceAnchors" not in json.load(f):  # 예전 형식 캐시: 다시 만든다
+                os.remove(path)
     if not os.path.exists(path):
         with tempfile.TemporaryDirectory() as tmp:
             _run_node(_base_job(model_path, 64, 64, {"fov": CAMERA_FOV_DEG, "position": [0, 1, 3], "target": [0, 1, 0]},
                                 frames=[], out_dir=tmp) | {"dumpRest": path}, tmp)
     return rig.RestPose.load(path)
+
+
+# ---------------------------------------------------------------------------
+# 어깨 실루엣 너비 보정 (조건 A와 '보이는 어깨 너비'를 맞춘다)
+# ---------------------------------------------------------------------------
+# 어깨 관절(모델 UpperArm 본, MediaPipe 어깨점)은 실루엣 안쪽에 있고 그 깊이가 모델·사람마다 다르다.
+# 그래서 '어깨 관절 높이에서 몸 실루엣 너비 / 어깨 관절 너비'를 양쪽에서 같은 정의로 재서 크기를 맞춘다.
+ARMS_DOWN_DEG = 70.0             # 모델 실루엣을 잴 때 위팔을 몸 쪽으로 내리는 각
+SILHOUETTE_MAX_FRAMES = 15       # 사람 실루엣을 잴 정면 프레임 수
+HANDS_BELOW_SHOULDER_PX = 20     # 손목이 어깨보다 이만큼 아래인 프레임만 (팔이 실루엣에 섞이지 않게)
+
+
+def _row_span(mask: np.ndarray, y: int, x: int) -> int:
+    """mask의 y행에서 x를 포함하는 연속 구간의 길이 (x가 마스크 밖이면 0)."""
+    row = mask[int(np.clip(y, 0, mask.shape[0] - 1))]
+    x = int(np.clip(x, 0, len(row) - 1))
+    if not row[x]:
+        return 0
+    left = x
+    while left > 0 and row[left - 1]:
+        left -= 1
+    right = x
+    while right < len(row) - 1 and row[right + 1]:
+        right += 1
+    return right - left + 1
+
+
+def model_silhouette_ratio(model_path: str, rest: rig.RestPose) -> float:
+    """모델의 (어깨 관절 높이 실루엣 너비 / 어깨 관절 너비). 팔을 내린 자세로 한 번 렌더해 재고 캐시한다."""
+    cache_path = rest_pose_path(model_path)
+    with open(cache_path, "r", encoding="utf-8") as f:
+        cache = json.load(f)
+    if "silhouetteRatio" in cache:
+        return float(cache["silhouetteRatio"])
+    down = math.radians(ARMS_DOWN_DEG)
+    bones = {
+        "leftUpperArm": rig.to_quaternion(rig.axis_angle(np.array([0, 0, 1.0]), -down)),
+        "rightUpperArm": rig.to_quaternion(rig.axis_angle(np.array([0, 0, 1.0]), down)),
+    }
+    shoulders = model_shoulders(rest, [rig.RigFrame(bones=bones)])
+    camera = plan_camera(shoulders, framing.FramingTarget())
+    with tempfile.TemporaryDirectory() as tmp:
+        out_dir = os.path.join(tmp, "frames")
+        _run_node(_base_job(model_path, camera.width, camera.height, camera.to_job(), [{"bones": bones}], out_dir), tmp)
+        img = cv2.imread(os.path.join(out_dir, "000000.png"))
+    mask = np.abs(img.astype(int) - np.array(BACKGROUND_RGB[::-1])).sum(axis=2) > 12
+    px = camera.project(shoulders[0])
+    mid = px.mean(axis=0)
+    ratio = _row_span(mask, round(mid[1]), round(mid[0])) / float(np.linalg.norm(px[0] - px[1]))
+    cache["silhouetteRatio"] = ratio
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=1)
+    return ratio
+
+
+def human_silhouette_ratio(path: str, raws, frontal: np.ndarray, fps: float, probe) -> Optional[float]:
+    """원본 화자의 (어깨점 높이 실루엣 너비 / MediaPipe 어깨점 너비) 중앙값. 정면·손이 어깨 아래인 프레임만.
+
+    MediaPipe selfie segmentation으로 사람 영역을 구한다. 잴 프레임이 없으면 None.
+    """
+    import mediapipe as mp
+
+    from . import video_io
+
+    candidates = []
+    for i in np.nonzero(frontal)[0]:
+        p = raws[i].pose_pixel
+        if p is None:
+            continue
+        wrist_y = min(p[landmarks.LEFT_WRIST, 1], p[landmarks.RIGHT_WRIST, 1])
+        shoulder_y = max(p[landmarks.LEFT_SHOULDER, 1], p[landmarks.RIGHT_SHOULDER, 1])
+        if wrist_y > shoulder_y + HANDS_BELOW_SHOULDER_PX:
+            candidates.append(int(i))
+    if not candidates:
+        return None
+    pick = set(candidates[:: max(1, len(candidates) // SILHOUETTE_MAX_FRAMES)][:SILHOUETTE_MAX_FRAMES])
+    ratios = []
+    with mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0) as seg:
+        for i, frame in enumerate(video_io.read_frames_cfr(path, fps, probe)):
+            if i > max(pick):
+                break
+            if i not in pick:
+                continue
+            raw = raws[i]
+            sx, sy = frame.shape[1] / raw.image_size[0], frame.shape[0] / raw.image_size[1]
+            ls = raw.pose_pixel[landmarks.LEFT_SHOULDER, :2] * (sx, sy)
+            rs = raw.pose_pixel[landmarks.RIGHT_SHOULDER, :2] * (sx, sy)
+            mask = seg.process(np.ascontiguousarray(frame[:, :, ::-1])).segmentation_mask > 0.5
+            mid = (ls + rs) / 2.0
+            span = _row_span(mask, round(mid[1]), round(mid[0]))
+            if span:
+                ratios.append(span / float(np.linalg.norm(ls - rs)))
+    return float(np.median(ratios)) if ratios else None
 
 
 # ---------------------------------------------------------------------------

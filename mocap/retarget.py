@@ -27,6 +27,11 @@ class FrameData:
     screen_anchor: Optional[np.ndarray] = None
     # ARKit 호환 블렌드셰이프 계수 (이름 → 0~1). 실측값을 증폭하지 않는다. 폴백 경로에서는 None.
     face_blendshapes: Optional[Dict[str, float]] = None
+    # 같은 영상 프레임의 2D 픽셀 좌표 (얼굴 접촉 IK용). 손과 얼굴의 상대 위치는 2D가 3D보다 정확하다:
+    # 3D에서는 손은 pose 손목, 얼굴은 pose 귀에 따로 붙여 상대 위치가 수 cm씩 어긋난다.
+    face_image: Optional[np.ndarray] = None        # (len(FACE_KEY_ORDER), 2)
+    left_hand_image: Optional[np.ndarray] = None   # (21, 2), 팔에 재배정한 뒤
+    right_hand_image: Optional[np.ndarray] = None  # (21, 2)
 
 
 def assign_hands(
