@@ -7,13 +7,13 @@ import { VRMLoaderPlugin, VRMUtils } from "@pixiv/three-vrm";
 
 const state = { renderer: null, scene: null, camera: null, vrm: null, expressionNames: new Map() };
 
-export async function init({ width, height, modelUrl, background, camera, lights, style }) {
+export async function init({ width, height, modelUrl, background, camera, lights, style, options = {} }) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
   document.body.appendChild(canvas);
 
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: options.antialias ?? true, preserveDrawingBuffer: true });
   renderer.setPixelRatio(1);
   renderer.setSize(width, height, false);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -28,9 +28,12 @@ export async function init({ width, height, modelUrl, background, camera, lights
     scene.add(obj);
   }
 
-  const cam = new THREE.PerspectiveCamera(camera.fov, width / height, 0.05, 20);
+  // near/far를 피사체 거리에 맞게 좁혀 깊이 정밀도를 높인다. 너무 넓으면(0.05~20m) 머리카락·얼굴 경계에서
+  // 깊이가 거의 같은 두 면이 실행마다 다르게 이겨 같은 입력에서도 픽셀이 달라졌다 (결정론 위반).
+  const cam = new THREE.PerspectiveCamera(camera.fov, width / height, camera.near ?? 0.05, camera.far ?? 20);
   cam.position.set(...camera.position);
   cam.lookAt(new THREE.Vector3(...camera.target));
+  state.size = { width, height };
 
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
@@ -165,8 +168,17 @@ function placeCamera() {
   state.camera.lookAt(anchor.clone().add(new THREE.Vector3(...cfg.target)));
 }
 
-export function renderFrame() {
+// frame.viewOffset = [dx, dy]: 화면에서 그림 전체를 (dx, dy) 픽셀 옮긴다 (원근은 그대로).
+// 조건 A에서 화자가 움직인 만큼 B·C를 옮기는 데 쓴다. 카메라 투영은 Python(mocap/model_render.py)과 같다.
+function applyViewOffset(offset) {
+  const { width, height } = state.size;
+  if (offset) state.camera.setViewOffset(width, height, -offset[0], -offset[1], width, height);
+  else state.camera.clearViewOffset();
+}
+
+export function renderFrame(frame) {
   if (state.cameraConfig.followBone && state.cameraConfig.followEachFrame) placeCamera();
+  applyViewOffset(frame && frame.viewOffset);
   state.renderer.render(state.scene, state.camera);
   return state.renderer.domElement.toDataURL("image/png");
 }

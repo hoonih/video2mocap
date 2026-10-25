@@ -47,11 +47,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--view",
-        choices=["side", "avatar", "skeleton", "original"],
+        choices=["side", "avatar", "skeleton", "original", "model"],
         default="side",
         help=(
             "side: 정규화한 원본(랜드마크 표시)과 캐릭터를 나란히, avatar: 캐릭터만(조건 C), "
-            "skeleton: 선과 점으로 된 골격만(조건 B), original: 원본을 같은 크기·위치로 정규화(조건 A) "
+            "skeleton: 선과 점으로 된 골격만(조건 B), original: 원본을 같은 크기·위치로 정규화(조건 A), "
+            "model: 3D 모델(VRM) 렌더(조건 C, 새 경로) "
             "(기본값: side)"
         ),
     )
@@ -102,6 +103,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-blendshapes",
         action="store_true",
         help="Face Landmarker를 쓰지 않고 Holistic 얼굴 좌표만 쓴다 (폴백 경로 강제)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "avatar", "VRoid_V110_Female_v1.1.3.vrm"),
+        help="--view model에서 쓸 VRM 모델 경로 (assets/avatar/README.md 참고)",
     )
     parser.add_argument(
         "--show-legs",
@@ -316,6 +322,26 @@ def _overlay_landmarks(canvas: np.ndarray, raw, track: TrackResult, transform: f
             cv2.circle(canvas, tuple(pt.astype(int)), 1, (200, 200, 200), -1)
 
 
+def _plan_model_frames(track: TrackResult, target: framing.FramingTarget, transform, model_path: str):
+    """3D 모델 경로: 리그·카메라를 계산하고 렌더 프레임 이터레이터를 돌려준다 (Phase 4E)."""
+    from . import model_render
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"아바타 모델이 없습니다: {model_path} (assets/avatar/README.md 참고)")
+    rest = model_render.ensure_rest_pose(model_path)
+    source_size = (track.probe.width, track.probe.height)
+    shoulders = framing.shoulder_track([r.pose_pixel for r in track.raws], track.pixel_size, source_size)
+    a_widths = frontal = None
+    if shoulders is not None:
+        a_widths = shoulders.widths * transform.scale  # 조건 A 화면에서의 어깨너비 (px)
+        frontal = shoulders.frontal_mask()
+    plan = model_render.plan_model_render(track.frames, rest, target, a_widths, frontal)
+    over = sum(1 for r in plan.rigs if r.violations)
+    print(f"리그: 해부학적 한계를 넘어 클램프한 프레임 {over}/{len(plan.rigs)} ({over / max(len(plan.rigs), 1):.1%})")
+    print("3D 렌더 중 (헤드리스 Chromium)...")
+    return model_render.render_plan(plan, model_path)
+
+
 def run(args: argparse.Namespace) -> int:
     if not os.path.exists(args.input):
         print(f"오류: 입력 파일을 찾을 수 없습니다: {args.input}", file=sys.stderr)
@@ -366,7 +392,10 @@ def run(args: argparse.Namespace) -> int:
 
     hide_legs = args.upper_body and not args.show_legs
     renderer = None
-    if args.view != "original":
+    model_frames = None
+    if args.view == "model":
+        model_frames = _plan_model_frames(track, target, transform, args.model)
+    elif args.view != "original":
         renderer_cls = SkeletonRenderer if args.view == "skeleton" else CapsuleRenderer
         renderer = renderer_cls(
             width=width,
@@ -383,6 +412,7 @@ def run(args: argparse.Namespace) -> int:
     view_label = {
         "side": "나란히 보기", "avatar": "캐릭터만 보기(조건 C)",
         "skeleton": "골격만 보기(조건 B)", "original": "원본 정규화(조건 A)",
+        "model": "3D 모델(조건 C)",
     }[args.view]
     print(f"출력: {out_path} ({width}x{height}, {view_label})")
     output_width = width * 2 if args.view == "side" else width
@@ -400,6 +430,8 @@ def run(args: argparse.Namespace) -> int:
                 original = framing.apply_original_transform(source, transform)
             if args.view == "original":
                 out = original
+            elif model_frames is not None:
+                out = next(model_frames)
             else:
                 rendered = renderer.render(frame_data)
                 if args.view == "side":

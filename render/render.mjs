@@ -14,16 +14,19 @@ const job = JSON.parse(await readFile(process.argv[2], "utf8"));
 await mkdir(job.outDir, { recursive: true });
 
 // 알 수 없는 프레임 키는 조용히 무시하지 않고 오류로 처리한다 (오타로 표정이 통째로 빠지는 것 방지)
-const FRAME_KEYS = new Set(["bones", "blendshapes", "dt"]);
+const FRAME_KEYS = new Set(["bones", "blendshapes", "dt", "viewOffset"]);
 job.frames.forEach((frame, i) => {
   const unknown = Object.keys(frame).filter((k) => !FRAME_KEYS.has(k));
   if (unknown.length) throw new Error(`frames[${i}]에 알 수 없는 키: ${unknown.join(", ")} (허용: ${[...FRAME_KEYS].join(", ")})`);
 });
 
 // GPU에 따라 결과가 달라지지 않도록 소프트웨어 GL(SwiftShader)을 고정한다.
-const browser = await chromium.launch({
-  args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
-});
+const GL_ARGS = {
+  swiftshader: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader"],
+  metal: ["--use-gl=angle", "--use-angle=metal", "--enable-gpu", "--ignore-gpu-blocklist"],
+};
+const backend = (job.options && job.options.gl) || "swiftshader";
+const browser = await chromium.launch({ args: GL_ARGS[backend] });
 const page = await browser.newPage({ viewport: { width: job.width, height: job.height } });
 page.on("console", (msg) => { if (msg.type() === "error") console.error("[page]", msg.text()); });
 page.on("pageerror", (err) => console.error("[page]", err.message));
@@ -42,7 +45,7 @@ await page.goto("http://render.local/index.html");
 
 const info = await page.evaluate((cfg) => AvatarScene.init(cfg), {
   width: job.width, height: job.height, modelUrl: "http://render.local/model.vrm",
-  background: job.background, camera: job.camera, lights: job.lights, style: job.style,
+  background: job.background, camera: job.camera, lights: job.lights, style: job.style, options: job.options,
 });
 console.error(`model: ${info.humanBones.length} bones, ${info.expressions.length} expressions, style ${JSON.stringify(info.style)}`);
 
@@ -54,7 +57,7 @@ if (job.dumpRest) {
 for (let i = 0; i < job.frames.length; i++) {
   const missing = await page.evaluate((f) => AvatarScene.applyFrame(f), job.frames[i]);
   if (missing.length && i === 0) console.error(`모델에 없는 표정: ${missing.join(", ")}`);
-  const dataUrl = await page.evaluate(() => AvatarScene.renderFrame());
+  const dataUrl = await page.evaluate((f) => AvatarScene.renderFrame(f), job.frames[i]);
   await writeFile(path.join(job.outDir, `${String(i).padStart(6, "0")}.png`), Buffer.from(dataUrl.split(",")[1], "base64"));
 }
 await browser.close();

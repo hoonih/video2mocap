@@ -33,3 +33,6 @@ assets/avatar/*.gltf
 render/node_modules/
 render/dist/
 assets/avatar/*.rest.json
+
+# 작업용 임시 산출물
+work/
