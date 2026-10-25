@@ -47,17 +47,25 @@ const info = await page.evaluate((cfg) => AvatarScene.init(cfg), {
   width: job.width, height: job.height, modelUrl: "http://render.local/model.vrm",
   background: job.background, camera: job.camera, lights: job.lights, style: job.style, options: job.options,
 });
-console.error(`model: ${info.humanBones.length} bones, ${info.expressions.length} expressions, style ${JSON.stringify(info.style)}`);
+console.error(`model: ${info.humanBones.length} bones, ${info.expressions.length} expressions, view ${info.view}, style ${JSON.stringify(info.style)}` +
+  (info.faceFeatures ? `, face ${info.faceFeatures.join(" ")}` : ""));
+
+if (job.debugFaceLoops) {
+  for (const l of await page.evaluate(() => AvatarScene.debugFaceLoops())) console.error(JSON.stringify(l));
+}
 
 if (job.dumpRest) {
   await writeFile(job.dumpRest, JSON.stringify(await page.evaluate(() => AvatarScene.dumpRestPose()), null, 1));
   console.error(`rest pose -> ${job.dumpRest}`);
 }
 
+const joints = [];  // 프레임별 주요 관절의 화면 좌표 (조건 B·C 정렬 검증용)
 for (let i = 0; i < job.frames.length; i++) {
   const missing = await page.evaluate((f) => AvatarScene.applyFrame(f), job.frames[i]);
   if (missing.length && i === 0) console.error(`모델에 없는 표정: ${missing.join(", ")}`);
-  const dataUrl = await page.evaluate((f) => AvatarScene.renderFrame(f), job.frames[i]);
-  await writeFile(path.join(job.outDir, `${String(i).padStart(6, "0")}.png`), Buffer.from(dataUrl.split(",")[1], "base64"));
+  const out = await page.evaluate((f) => AvatarScene.renderFrame(f), job.frames[i]);
+  await writeFile(path.join(job.outDir, `${String(i).padStart(6, "0")}.png`), Buffer.from(out.png.split(",")[1], "base64"));
+  joints.push(out.joints);
 }
+await writeFile(path.join(job.outDir, "joints.json"), JSON.stringify(joints));
 await browser.close();

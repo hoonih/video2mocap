@@ -47,12 +47,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--view",
-        choices=["side", "avatar", "skeleton", "original", "model"],
+        choices=["side", "avatar", "skeleton", "original", "model", "bones"],
         default="side",
         help=(
             "side: 정규화한 원본(랜드마크 표시)과 캐릭터를 나란히, avatar: 캐릭터만(조건 C), "
             "skeleton: 선과 점으로 된 골격만(조건 B), original: 원본을 같은 크기·위치로 정규화(조건 A), "
-            "model: 3D 모델(VRM) 렌더(조건 C, 새 경로) "
+            "model: 3D 모델(VRM) 렌더(조건 C, 새 경로), bones: 같은 모델 리그의 뼈와 얼굴 윤곽만(조건 B, 새 경로) "
             "(기본값: side)"
         ),
     )
@@ -333,7 +333,7 @@ def _overlay_landmarks(canvas: np.ndarray, raw, track: TrackResult, transform: f
             cv2.circle(canvas, tuple(pt.astype(int)), 1, (200, 200, 200), -1)
 
 
-def _plan_model_frames(track: TrackResult, target: framing.FramingTarget, transform, model_path: str):
+def _plan_model_frames(track: TrackResult, target: framing.FramingTarget, transform, model_path: str, view: str = "model"):
     """3D 모델 경로: 리그·카메라를 계산하고 렌더 프레임 이터레이터를 돌려준다 (Phase 4E)."""
     from . import model_render
 
@@ -360,7 +360,7 @@ def _plan_model_frames(track: TrackResult, target: framing.FramingTarget, transf
     print(f"리그: 해부학적 한계를 넘어 클램프한 프레임 {over}/{len(plan.rigs)} ({over / max(len(plan.rigs), 1):.1%}), "
           f"얼굴 접촉 보정 프레임 {contact}")
     print("3D 렌더 중 (헤드리스 Chromium)...")
-    return model_render.render_plan(plan, model_path)
+    return model_render.render_plan(plan, model_path, view)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -414,8 +414,8 @@ def run(args: argparse.Namespace) -> int:
     hide_legs = args.upper_body and not args.show_legs
     renderer = None
     model_frames = None
-    if args.view == "model":
-        model_frames = _plan_model_frames(track, target, transform, args.model)
+    if args.view in ("model", "bones"):
+        model_frames = _plan_model_frames(track, target, transform, args.model, args.view)
     elif args.view != "original":
         renderer_cls = SkeletonRenderer if args.view == "skeleton" else CapsuleRenderer
         renderer = renderer_cls(
@@ -433,7 +433,7 @@ def run(args: argparse.Namespace) -> int:
     view_label = {
         "side": "나란히 보기", "avatar": "캐릭터만 보기(조건 C)",
         "skeleton": "골격만 보기(조건 B)", "original": "원본 정규화(조건 A)",
-        "model": "3D 모델(조건 C)",
+        "model": "3D 모델(조건 C)", "bones": "3D 모델 뼈대(조건 B)",
     }[args.view]
     print(f"출력: {out_path} ({width}x{height}, {view_label})")
     output_width = width * 2 if args.view == "side" else width

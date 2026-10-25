@@ -75,3 +75,36 @@ def test_model_render_is_deterministic(tmp_path):
     assert len(a) == 3 and a[0].shape == (320, 180, 3)
     assert all(np.array_equal(x, y) for x, y in zip(a, b))
     assert not np.array_equal(a[0], a[2])  # 표정이 실제로 반영됨
+
+
+@needs_model
+def test_bones_and_model_views_align_and_match_python_projection():
+    """조건 B(bones)와 C(model)의 주요 관절 화면 좌표가 같고, Python 투영과 1px 이내로 일치해야 한다."""
+    import math
+
+    from mocap import landmarks, rig
+    from mocap.retarget import FrameData
+
+    rest = model_render.ensure_rest_pose(model_render.DEFAULT_MODEL_PATH)
+    pose = landmarks.build_neutral_pose()
+    raised = pose.copy()
+    raised[landmarks.LEFT_ELBOW] = (0.35, -0.75, -0.1)   # 왼팔을 들어 올린 자세 (MediaPipe 좌표)
+    raised[landmarks.LEFT_WRIST] = (0.2, -0.95, -0.25)
+    frames = [FrameData(pose=p, face_blendshapes={"browInnerUp": 0.8}, screen_anchor=np.array(a))
+              for p, a in ((pose, (90.0, 135.0)), (raised, (100.0, 130.0)))]
+    plan = model_render.plan_model_render(frames, rest, framing.FramingTarget(output_size=(180, 320)))
+    jb, jc = [], []
+    b = list(model_render.render_plan(plan, model_render.DEFAULT_MODEL_PATH, "bones", jb))
+    c = list(model_render.render_plan(plan, model_render.DEFAULT_MODEL_PATH, "model", jc))
+    assert len(b) == len(c) == 2 and b[0].shape == c[0].shape == (320, 180, 3)
+    for fb, fc, r, off in zip(jb, jc, plan.rigs, plan.offsets):
+        assert fb.keys() == fc.keys()
+        pos, _ = rig.forward_kinematics(rest, r.bones)
+        for name in fb:
+            assert fb[name] == pytest.approx(fc[name], abs=1e-6), name                      # B = C
+            expected = plan.camera.project(np.array([pos.get(name, rest.positions[name])]), off)[0]
+            assert math.dist(fc[name], expected) <= 1.0, name                                # Python 투영
+    spread = max(int((f.max(axis=2).astype(int) - f.min(axis=2)).max()) for f in b)
+    assert spread <= 4  # 조건 B는 회색조 선·점만
+    again = list(model_render.render_plan(plan, model_render.DEFAULT_MODEL_PATH, "bones"))
+    assert all(np.array_equal(x, y) for x, y in zip(b, again))  # 결정론

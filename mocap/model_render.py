@@ -289,19 +289,31 @@ def plan_model_render(
     return ModelRenderPlan(camera=camera, frames=job_frames, rigs=rigs, shoulders=shoulders, offsets=offsets)
 
 
-def render_plan(plan: ModelRenderPlan, model_path: str, view: str = "model") -> Iterator[np.ndarray]:
-    """계획을 헤드리스 렌더러로 돌려 BGR 프레임을 순서대로 낸다. 임시 PNG는 끝나면 지운다."""
-    if view != "model":
+MODEL_VIEWS = ("model", "bones")  # model: 조건 C(메시), bones: 조건 B(같은 리그의 뼈·얼굴 윤곽만)
+
+
+def render_plan(
+    plan: ModelRenderPlan, model_path: str, view: str = "model", joints_out: Optional[list] = None
+) -> Iterator[np.ndarray]:
+    """계획을 헤드리스 렌더러로 돌려 BGR 프레임을 순서대로 낸다. 임시 PNG는 끝나면 지운다.
+
+    joints_out에 리스트를 주면 프레임별 주요 관절의 화면 좌표({본: [x, y]})를 채운다 (정렬 검증용).
+    """
+    if view not in MODEL_VIEWS:
         raise ValueError(f"지원하지 않는 3D 뷰: {view}")
     workdir = tempfile.mkdtemp(prefix="model_render_")
     try:
         out_dir = os.path.join(workdir, "frames")
         job = _base_job(model_path, plan.camera.width, plan.camera.height, plan.camera.to_job(), plan.frames, out_dir)
+        job["options"] = {"view": view}
         keep = os.environ.get("MOCAP_KEEP_RENDER_JOB")  # 디버그: 렌더 작업 JSON을 이 경로에 남긴다
         if keep:
             with open(keep, "w", encoding="utf-8") as f:
                 json.dump(dict(job, outDir=""), f)
         _run_node(job, workdir)
+        if joints_out is not None:
+            with open(os.path.join(out_dir, "joints.json"), "r", encoding="utf-8") as f:
+                joints_out.extend(json.load(f))
         for i in range(len(plan.frames)):
             img = cv2.imread(os.path.join(out_dir, f"{i:06d}.png"), cv2.IMREAD_COLOR)
             if img is None:
